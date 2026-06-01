@@ -129,19 +129,19 @@ done
 # === FUNCTIONS ===
 
 log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+    echo -e "${BLUE}[INFO]${NC} $1" >&2
 }
 
 log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1"
+    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
 }
 
 log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
+    echo -e "${YELLOW}[WARNING]${NC} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
 check_oc_command() {
@@ -186,9 +186,22 @@ query_prometheus() {
         return 1
     fi
 
-    # Get auth token
+    # Try bearer token first (works for regular oc login sessions).
+    # Falls back to minting a short-lived SA token, which works for any auth
+    # method including certificate-based system:admin kubeconfigs.
     local token
     token=$(oc whoami -t 2>/dev/null || echo "")
+
+    if [[ -z "$token" ]]; then
+        [[ "$VERBOSE" == "true" ]] && log_info "query_prometheus: no OAuth token, minting prometheus-k8s SA token"
+        token=$(oc create token prometheus-k8s -n openshift-monitoring --duration=10m 2>/dev/null)
+        rc=$?
+        if [[ $rc -ne 0 || -z "$token" ]]; then
+            [[ "$VERBOSE" == "true" ]] && log_error "query_prometheus: failed to create SA token (exit $rc)"
+            echo "N/A"
+            return 1
+        fi
+    fi
 
     if [[ -z "$token" ]]; then
         echo "N/A"
