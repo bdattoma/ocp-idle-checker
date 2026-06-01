@@ -187,8 +187,7 @@ query_prometheus() {
     fi
 
     # Try bearer token first (works for regular oc login sessions).
-    # Falls back to minting a short-lived SA token, which works for any auth
-    # method including certificate-based system:admin kubeconfigs.
+    # Falls back to minting a short-lived SA token
     local token
     token=$(oc whoami -t 2>/dev/null || echo "")
 
