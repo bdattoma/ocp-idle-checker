@@ -24,6 +24,7 @@ ML_NODE_PATTERN="p5|p4d|g5"    # Instance types to consider as ML nodes
 VERBOSE=true                   # Set to false for minimal output
 EXPORT_CSV=""                  # Path to export CSV file (empty = no export)
 EXPORT_JSON=""                 # Path to export JSON file (empty = no export)
+PROMETHEUS_TOKEN_ARG=""        # Pre-generated Prometheus token (empty = auto-generate)
 
 # Colors for output
 RED='\033[0;31m'
@@ -42,6 +43,7 @@ OpenShift Cluster Idle Detection Script
 Options:
   -w, --window MINUTES       Time window for CPU/Memory averages (default: $TIME_WINDOW_MINUTES)
                             Set to 0 for instant metrics only
+                            Note: Very large windows (>24h) may be rejected by Prometheus
   -c, --cpu-threshold N      CPU idle threshold percentage (default: $CPU_IDLE_THRESHOLD)
   -m, --mem-threshold N      Memory idle threshold percentage (default: $MEMORY_IDLE_THRESHOLD)
   -a, --api-threshold N      API server requests/sec threshold (default: $APISERVER_IDLE_THRESHOLD)
@@ -51,6 +53,7 @@ Options:
                             (default: $OPERATOR_NAMESPACES)
   --csv FILE                Export results to CSV file
   --json FILE               Export results to JSON file
+  --token TOKEN             Use pre-generated Prometheus token (skip token minting)
   -q, --quiet               Quiet mode - show only criteria results and status
   --no-ml-check             Skip ML node specific checks
   -h, --help                Show this help message
@@ -63,6 +66,10 @@ Examples:
   $0 -o 30                                    # Consider idle if operators unchanged for 30+ days
   $0 --operator-namespaces "openshift-operators"  # Check custom operator namespace
   $0 -q --csv results.csv --json results.json     # Export to CSV and JSON files
+
+  # Use pre-generated token (useful for automation)
+  TOKEN=\$(oc create token prometheus-k8s -n openshift-monitoring --duration=10m)
+  $0 --token "\$TOKEN" -w 10
 
 EOF
     exit 0
@@ -105,6 +112,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --json)
             EXPORT_JSON="$2"
+            shift 2
+            ;;
+        --token)
+            PROMETHEUS_TOKEN_ARG="$2"
             shift 2
             ;;
         -q|--quiet)
@@ -171,46 +182,105 @@ check_dependencies() {
     fi
 }
 
+# Global token variable - minted once per session
+PROMETHEUS_TOKEN=""
+
+get_prometheus_token() {
+    # Check if token was provided via command-line argument
+    if [[ -n "$PROMETHEUS_TOKEN" ]]; then
+        log_info "Using cached Prometheus token"
+        return 0
+    fi
+
+    if [[ -n "$PROMETHEUS_TOKEN_ARG" ]]; then
+        log_info "Using provided Prometheus token from command-line"
+        PROMETHEUS_TOKEN="$PROMETHEUS_TOKEN_ARG"
+        return 0
+    fi
+
+    # Try bearer token first (works for regular oc login sessions)
+    local token
+    token=$(oc whoami -t 2>/dev/null || echo "")
+
+    if [[ -z "$token" ]]; then
+        log_info "No OAuth token, minting prometheus-k8s SA token (once per session)"
+        token=$(oc create token prometheus-k8s -n openshift-monitoring --duration=10m 2>/dev/null)
+        rc=$?
+        if [[ $rc -ne 0 || -z "$token" ]]; then
+            log_error "Failed to create SA token (exit $rc)"
+            return 1
+        fi
+    else
+        [[ "$VERBOSE" == "true" ]] && log_info "Using OAuth token from oc whoami -t"
+    fi
+    PROMETHEUS_TOKEN="$token"
+}
+
 query_prometheus() {
     # Query Prometheus/Thanos for metrics
     # Args: $1 = PromQL query
     local query="$1"
     local result
+    local response
+    local status
+    local error_msg
 
     # Try to get thanos-querier route
     local thanos_host
-    thanos_host=$(timeout 5 oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
+    thanos_host=$(timeout 5 oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>&1)
+    local rc=$?
 
-    if [[ -z "$thanos_host" ]]; then
+    if [[ $rc -ne 0 || -z "$thanos_host" ]]; then
+        [[ "$VERBOSE" == "true" ]] && log_error "Failed to get thanos-querier route: $thanos_host"
         echo "N/A"
         return 1
     fi
 
-    # Try bearer token first (works for regular oc login sessions).
-    # Falls back to minting a short-lived SA token
-    local token
-    token=$(oc whoami -t 2>/dev/null || echo "")
+    # Query Prometheus - capture response and HTTP status separately
+    local http_code
+    local curl_output
 
-    if [[ -z "$token" ]]; then
-        [[ "$VERBOSE" == "true" ]] && log_info "query_prometheus: no OAuth token, minting prometheus-k8s SA token"
-        token=$(oc create token prometheus-k8s -n openshift-monitoring --duration=10m 2>/dev/null)
-        rc=$?
-        if [[ $rc -ne 0 || -z "$token" ]]; then
-            [[ "$VERBOSE" == "true" ]] && log_error "query_prometheus: failed to create SA token (exit $rc)"
-            echo "N/A"
-            return 1
-        fi
-    fi
+    curl_output=$(timeout 60 curl -sk -w "\n%{http_code}" -H "Authorization: Bearer $PROMETHEUS_TOKEN" \
+        "https://$thanos_host/api/v1/query?query=$(echo "$query" | jq -sRr @uri)" 2>&1)
+    rc=$?
 
-    if [[ -z "$token" ]]; then
+    # Split response and HTTP code (last line)
+    http_code=$(echo "$curl_output" | tail -n1)
+    response=$(echo "$curl_output" | head -n-1)
+
+    if [[ $rc -ne 0 ]]; then
+        [[ "$VERBOSE" == "true" ]] && log_error "Prometheus query failed (curl exit $rc)"
+        [[ "$VERBOSE" == "true" ]] && log_error "Output: ${curl_output:0:300}"
         echo "N/A"
         return 1
     fi
 
-    # Query Prometheus
-    result=$(timeout 15 curl -sk -H "Authorization: Bearer $token" \
-        "https://$thanos_host/api/v1/query?query=$(echo "$query" | jq -sRr @uri)" 2>/dev/null | \
-        jq -r '.data.result[0].value[1] // "N/A"' 2>/dev/null || echo "N/A")
+    # Check HTTP status code
+    if [[ "$http_code" != "200" ]]; then
+        [[ "$VERBOSE" == "true" ]] && log_error "Prometheus returned HTTP $http_code"
+        [[ "$VERBOSE" == "true" ]] && log_error "Query was: $query"
+        [[ "$VERBOSE" == "true" ]] && log_error "Response: ${response:0:500}"
+        echo "N/A"
+        return 1
+    fi
+
+    # Check if response is valid JSON
+    if ! echo "$response" | jq empty 2>/dev/null; then
+        [[ "$VERBOSE" == "true" ]] && log_error "Prometheus returned non-JSON response"
+        [[ "$VERBOSE" == "true" ]] && log_error "Query was: $query"
+        [[ "$VERBOSE" == "true" ]] && log_error "Response (first 500 chars): ${response:0:500}"
+        echo "N/A"
+        return 1
+    fi
+
+    # Extract result value
+    result=$(echo "$response" | jq -r '.data.result[0].value[1] // "N/A"' 2>/dev/null)
+
+    if [[ "$result" == "N/A" ]]; then
+        [[ "$VERBOSE" == "true" ]] && log_warning "Query returned no results: $query"
+        local result_data=$(echo "$response" | jq -c '.data.result' 2>/dev/null)
+        [[ "$VERBOSE" == "true" ]] && log_warning "Result data: $result_data"
+    fi
 
     echo "$result"
 }
@@ -276,6 +346,11 @@ get_apiserver_request_rate_breakdown() {
     # Get breakdown of API requests by verb (GET, POST, etc.) for verbose output
     local window="${TIME_WINDOW_MINUTES}m"
     local query
+    local response
+    local thanos_host
+    local token
+    local status
+    local error_msg
 
     if [[ $TIME_WINDOW_MINUTES -gt 0 ]]; then
         query="sum by (verb) (rate(apiserver_request_total[${window}]))"
@@ -283,28 +358,40 @@ get_apiserver_request_rate_breakdown() {
         query="sum by (verb) (rate(apiserver_request_total[5m]))"
     fi
 
-    local result
-    result=$(query_prometheus "$query" 2>/dev/null || echo "N/A")
-
-    if [[ "$result" == "N/A" ]]; then
-        echo "N/A"
-    else
-        # Try to get the full JSON response for breakdown
-        local thanos_host
-        thanos_host=$(timeout 5 oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null || echo "")
-
-        if [[ -n "$thanos_host" ]]; then
-            local token
-            token=$(oc whoami -t 2>/dev/null || echo "")
-
-            if [[ -n "$token" ]]; then
-                timeout 15 curl -sk -H "Authorization: Bearer $token" \
-                    "https://$thanos_host/api/v1/query?query=$(echo "$query" | jq -sRr @uri)" 2>/dev/null | \
-                    jq -r '.data.result[] | "\(.metric.verb): \(.value[1])"' 2>/dev/null | \
-                    awk '{printf "  %s (%.2f req/s)\n", $1, $2}' || echo "N/A"
-            fi
-        fi
+    # Get thanos-querier route
+    thanos_host=$(timeout 5 oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>&1)
+    if [[ $? -ne 0 || -z "$thanos_host" ]]; then
+        echo "  Breakdown not available (could not get thanos-querier route)"
+        return 1
     fi
+    # Query Prometheus for full breakdown
+    response=$(timeout 60 curl -sk -H "Authorization: Bearer $PROMETHEUS_TOKEN" \
+        "https://$thanos_host/api/v1/query?query=$(echo "$query" | jq -sRr @uri)" 2>&1)
+
+    if [[ $? -ne 0 ]]; then
+        echo "  Breakdown not available (query failed)"
+        [[ "$VERBOSE" == "true" ]] && log_error "Breakdown query curl failed: ${response:0:200}"
+        return 1
+    fi
+
+    # Check if response is valid
+    status=$(echo "$response" | jq -r '.status // "error"' 2>&1)
+    if [[ "$status" != "success" ]]; then
+        error_msg=$(echo "$response" | jq -r '.error // .errorType // "Unknown error"' 2>&1)
+        echo "  Breakdown not available (API error: $error_msg)"
+        return 1
+    fi
+
+    # Parse and display breakdown
+    local breakdown
+    breakdown=$(echo "$response" | jq -r '.data.result[] | "\(.metric.verb): \(.value[1])"' 2>&1)
+
+    if [[ -z "$breakdown" ]]; then
+        echo "  No breakdown data available"
+        return 1
+    fi
+
+    echo "$breakdown" | awk '{printf "  %s (%.2f req/s)\n", $1, $2}'
 }
 
 get_node_cpu_usage() {
@@ -771,6 +858,8 @@ fi
 # Check prerequisites
 check_oc_command
 check_dependencies
+
+get_prometheus_token
 
 if [[ "$VERBOSE" == "true" ]]; then
     # Get cluster name
