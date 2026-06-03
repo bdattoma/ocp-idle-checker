@@ -933,8 +933,8 @@ else
 
     # Determine idle status based on both instant and windowed metrics
     cpu_to_check="$instant_cpu"
-    local instant_idle=false
-    local windowed_idle=false
+    instant_idle=false
+    windowed_idle=false
 
     # Check instant CPU
     if [[ "$instant_cpu" != "N/A" ]]; then
@@ -1039,8 +1039,8 @@ else
 
     # Determine idle status based on both instant and windowed metrics
     mem_to_check="$instant_mem"
-    local instant_idle=false
-    local windowed_idle=false
+    instant_idle=false
+    windowed_idle=false
 
     # Check instant memory
     if [[ "$instant_mem" != "N/A" ]]; then
@@ -1181,6 +1181,11 @@ if [[ "$CHECK_ML_NODES" == "true" ]] && [[ "$VERBOSE" == "true" ]]; then
 
         # Display per-node usage
         while IFS='|' read -r node_name gpu_vendor gpu_count instance_type; do
+            # Trim whitespace from variables
+            node_name=$(echo "$node_name" | xargs)
+            gpu_vendor=$(echo "$gpu_vendor" | xargs)
+            instance_type=$(echo "$instance_type" | xargs)
+
             if [[ -n "$node_name" ]]; then
                 # Get current usage for this node
                 node_stats=$(timeout 10 oc adm top node "$node_name" --no-headers 2>/dev/null || echo "")
@@ -1193,14 +1198,22 @@ if [[ "$CHECK_ML_NODES" == "true" ]] && [[ "$VERBOSE" == "true" ]]; then
 
                     # Get time-windowed usage for this specific node if enabled
                     if [[ $TIME_WINDOW_MINUTES -gt 0 ]]; then
+                        # Temporarily disable verbose logging for per-node queries
+                        saved_verbose="$VERBOSE"
+                        VERBOSE=false
+
                         # CPU windowed for this node
-                        local window="${TIME_WINDOW_MINUTES}m"
-                        local cpu_query="(1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",instance=~\"${node_name}.*\"}[${window}]))) * 100"
-                        local cpu_windowed=$(query_prometheus "$cpu_query")
+                        window="${TIME_WINDOW_MINUTES}m"
+                        cpu_query="(1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",instance=~\"${node_name}.*\"}[${window}]))) * 100"
+                        cpu_windowed=$(query_prometheus "$cpu_query")
 
                         # Memory windowed for this node
-                        local mem_query="(1 - avg_over_time((avg(node_memory_MemAvailable_bytes{instance=~\"${node_name}.*\"}) / avg(node_memory_MemTotal_bytes{instance=~\"${node_name}.*\"}))[${window}:])) * 100"
-                        local mem_windowed=$(query_prometheus "$mem_query")
+                        mem_query="(1 - avg_over_time((avg(node_memory_MemAvailable_bytes{instance=~\"${node_name}.*\"}) / avg(node_memory_MemTotal_bytes{instance=~\"${node_name}.*\"}))[${window}:])) * 100"
+                        mem_windowed=$(query_prometheus "$mem_query")
+
+                        # TODO: get GPU memory and GPU usage using vendor-specific queries
+                        # Restore verbose setting
+                        VERBOSE="$saved_verbose"
 
                         if [[ "$cpu_windowed" != "N/A" ]] && [[ "$mem_windowed" != "N/A" ]]; then
                             cpu_windowed=$(awk -v val="$cpu_windowed" 'BEGIN {printf "%.2f", val}')
