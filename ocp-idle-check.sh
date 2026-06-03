@@ -143,8 +143,8 @@ log_info() {
     echo -e "${BLUE}[INFO]${NC} $1" >&2
 }
 
-log_success() {
-    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
+log_info() {
+    echo -e "${GREEN}[IDLE]${NC} $1" >&2
 }
 
 log_warning() {
@@ -473,39 +473,54 @@ get_ml_node_usage_windowed() {
     fi
 }
 
+get_all_gpu_node_data() {
+    # Get all GPU node information in one API call
+    # Returns: one line per GPU node in format: name|vendor|gpu_count|instance_type
+    # Returns "N/A" if no GPU nodes found
+
+    local nodes_json
+    nodes_json=$(timeout 10 oc get nodes -o json 2>/dev/null)
+
+    if [[ -z "$nodes_json" ]]; then
+        echo "N/A"
+        return 1
+    fi
+
+    # Extract GPU nodes with all their info in one pass
+    local gpu_data
+    gpu_data=$(echo "$nodes_json" | jq -r '.items[] |
+        select(.status.capacity["nvidia.com/gpu"] != null or .status.capacity["amd.com/gpu"] != null) |
+        .metadata.name + "|" +
+        (if .status.capacity["nvidia.com/gpu"] != null then "NVIDIA"
+         elif .status.capacity["amd.com/gpu"] != null then "AMD"
+         else "Unknown" end) + "|" +
+        (.status.capacity["nvidia.com/gpu"] // .status.capacity["amd.com/gpu"] // "0") + "|" +
+        (.metadata.labels["node.kubernetes.io/instance-type"] // "unknown")
+    ' 2>/dev/null)
+
+    if [[ -z "$gpu_data" ]]; then
+        echo "N/A"
+        return 1
+    fi
+
+    echo "$gpu_data"
+}
+
 get_gpu_nodes() {
-    # Check for GPU nodes by looking at capacity/allocatable resources
-    local gpu_nodes=""
-    local gpu_type=""
-    local gpu_count=0
+    # Legacy function - returns node names only for backward compatibility
+    # Format: nodenames:count:vendor
+    local gpu_data=$(get_all_gpu_node_data)
 
-    # Check for NVIDIA GPUs
-    local nvidia_nodes=$(timeout 10 oc get nodes -o json 2>/dev/null | \
-        jq -r '.items[] | select(.status.capacity["nvidia.com/gpu"] != null) | .metadata.name' 2>/dev/null || echo "")
-
-    if [[ -n "$nvidia_nodes" ]]; then
-        gpu_type="NVIDIA"
-        gpu_count=$(echo "$nvidia_nodes" | wc -l)
-        gpu_nodes="$nvidia_nodes"
-    fi
-
-    # Check for AMD GPUs if no NVIDIA found
-    if [[ -z "$gpu_nodes" ]]; then
-        local amd_nodes=$(timeout 10 oc get nodes -o json 2>/dev/null | \
-            jq -r '.items[] | select(.status.capacity["amd.com/gpu"] != null) | .metadata.name' 2>/dev/null || echo "")
-
-        if [[ -n "$amd_nodes" ]]; then
-            gpu_type="AMD"
-            gpu_count=$(echo "$amd_nodes" | wc -l)
-            gpu_nodes="$amd_nodes"
-        fi
-    fi
-
-    if [[ -z "$gpu_nodes" ]]; then
+    if [[ "$gpu_data" == "N/A" ]]; then
         echo "N/A:0:N/A"
-    else
-        echo "$gpu_nodes:$gpu_count:$gpu_type"
+        return
     fi
+
+    local node_names=$(echo "$gpu_data" | cut -d'|' -f1 | tr '\n' ' ')
+    local node_count=$(echo "$gpu_data" | wc -l)
+    local first_vendor=$(echo "$gpu_data" | head -1 | cut -d'|' -f2)
+
+    echo "$node_names:$node_count:$first_vendor"
 }
 
 get_gpu_machines() {
@@ -535,7 +550,7 @@ get_gpu_info() {
     local gpu_node_info=$(get_gpu_nodes)
     local nodes=$(echo "$gpu_node_info" | cut -d':' -f1)
     local node_count=$(echo "$gpu_node_info" | cut -d':' -f2)
-    local gpu_type=$(echo "$gpu_node_info" | cut -d':' -f3)
+    local gpu_vendor=$(echo "$gpu_node_info" | cut -d':' -f3)
 
     if [[ "$nodes" == "N/A" ]]; then
         # No GPU nodes found, check for GPU machines
@@ -594,19 +609,19 @@ get_gpu_flavors() {
     local flavors=""
     while IFS= read -r node; do
         if [[ -n "$node" ]]; then
-            local gpu_type=$(oc get node "$node" -o json 2>/dev/null | \
+            local gpu_vendor=$(oc get node "$node" -o json 2>/dev/null | \
                 jq -r 'if .status.capacity["nvidia.com/gpu"] != null then "NVIDIA" elif .status.capacity["amd.com/gpu"] != null then "AMD" else "Unknown" end' 2>/dev/null)
             local instance_type=$(oc get node "$node" -o jsonpath='{.metadata.labels.node\.kubernetes\.io/instance-type}' 2>/dev/null)
 
-            local flavor="${gpu_type}"
+            local gpu_info="${gpu_vendor}"
             if [[ -n "$instance_type" ]]; then
-                flavor="${flavor}(${instance_type})"
+                gpu_info="${gpu_info}(${instance_type})"
             fi
 
             if [[ -z "$flavors" ]]; then
-                flavors="$flavor"
+                flavors="$gpu_info"
             elif [[ "$flavors" != *"$flavor"* ]]; then
-                flavors="${flavors},${flavor}"
+                flavors="${flavors},${gpu_info}"
             fi
         fi
     done <<< "$nodes"
@@ -838,13 +853,6 @@ get_recent_pod_activity() {
     echo "$pod_events"
 }
 
-check_api_activity() {
-    # Check for recent API requests (excluding system components)
-    local api_requests
-    api_requests=$(oc get events -A --field-selector involvedObject.kind=Deployment,involvedObject.kind=StatefulSet,involvedObject.kind=Job --sort-by='.lastTimestamp' 2>/dev/null | tail -n +2 | head -n 1 | wc -l)
-    echo "$api_requests"
-}
-
 # === MAIN SCRIPT ===
 
 if [[ "$VERBOSE" == "true" ]]; then
@@ -923,26 +931,63 @@ else
         fi
     fi
 
-    # Determine which metric to use for idle check (prefer windowed if available)
+    # Determine idle status based on both instant and windowed metrics
     cpu_to_check="$instant_cpu"
-    if [[ "$cpu_windowed" != "N/A" ]]; then
-        cpu_to_check="$cpu_windowed"
-        if [[ "$VERBOSE" == "true" ]]; then
-            echo "Using time-windowed average for idle detection"
+    local instant_idle=false
+    local windowed_idle=false
+
+    # Check instant CPU
+    if [[ "$instant_cpu" != "N/A" ]]; then
+        if awk -v cpu="$instant_cpu" -v threshold="$CPU_IDLE_THRESHOLD" 'BEGIN {exit !(cpu < threshold)}'; then
+            instant_idle=true
         fi
     fi
 
-    # Use awk for comparison
-    if [[ "$cpu_to_check" != "N/A" ]]; then
-        if awk -v cpu="$cpu_to_check" -v threshold="$CPU_IDLE_THRESHOLD" 'BEGIN {exit !(cpu < threshold)}'; then
+    # Check windowed CPU
+    if [[ "$cpu_windowed" != "N/A" ]]; then
+        cpu_to_check="$cpu_windowed"
+        if awk -v cpu="$cpu_windowed" -v threshold="$CPU_IDLE_THRESHOLD" 'BEGIN {exit !(cpu < threshold)}'; then
+            windowed_idle=true
+        fi
+    fi
+
+    # Decision logic:
+    # - If we have windowed data, use it for primary decision
+    # - But if windowed is IDLE and current is ACTIVE, flag as currently active
+    if [[ "$cpu_windowed" != "N/A" ]]; then
+        if [[ "$windowed_idle" == "true" ]]; then
+            if [[ "$instant_idle" == "false" && "$instant_cpu" != "N/A" ]]; then
+                # Average is idle but currently active
+                if [[ "$VERBOSE" == "true" ]]; then
+                    log_warning "CPU average is IDLE (${cpu_windowed}%) but currently ACTIVE (${instant_cpu}%)"
+                fi
+                cpu_result="ACTIVE"
+            else
+                # Both average and current are idle
+                if [[ "$VERBOSE" == "true" ]]; then
+                    log_info "CPU usage is IDLE (avg: ${cpu_windowed}%, current: ${instant_cpu}%)"
+                fi
+                cpu_result="IDLE"
+                ((idle_criteria_met++))
+            fi
+        else
+            # Windowed average is active
             if [[ "$VERBOSE" == "true" ]]; then
-                log_success "CPU usage is IDLE (< ${CPU_IDLE_THRESHOLD}%)"
+                log_warning "CPU usage is ACTIVE (avg: ${cpu_windowed}%)"
+            fi
+            cpu_result="ACTIVE"
+        fi
+    else
+        # No windowed data, use instant only
+        if [[ "$instant_idle" == "true" ]]; then
+            if [[ "$VERBOSE" == "true" ]]; then
+                log_info "CPU usage is IDLE (${instant_cpu}%)"
             fi
             cpu_result="IDLE"
             ((idle_criteria_met++))
         else
             if [[ "$VERBOSE" == "true" ]]; then
-                log_warning "CPU usage is ACTIVE (>= ${CPU_IDLE_THRESHOLD}%)"
+                log_warning "CPU usage is ACTIVE (${instant_cpu}%)"
             fi
             cpu_result="ACTIVE"
         fi
@@ -992,26 +1037,63 @@ else
         fi
     fi
 
-    # Determine which metric to use for idle check (prefer windowed if available)
+    # Determine idle status based on both instant and windowed metrics
     mem_to_check="$instant_mem"
-    if [[ "$mem_windowed" != "N/A" ]]; then
-        mem_to_check="$mem_windowed"
-        if [[ "$VERBOSE" == "true" ]]; then
-            echo "Using time-windowed average for idle detection"
+    local instant_idle=false
+    local windowed_idle=false
+
+    # Check instant memory
+    if [[ "$instant_mem" != "N/A" ]]; then
+        if awk -v mem="$instant_mem" -v threshold="$MEMORY_IDLE_THRESHOLD" 'BEGIN {exit !(mem < threshold)}'; then
+            instant_idle=true
         fi
     fi
 
-    # Use awk for comparison
-    if [[ "$mem_to_check" != "N/A" ]]; then
-        if awk -v mem="$mem_to_check" -v threshold="$MEMORY_IDLE_THRESHOLD" 'BEGIN {exit !(mem < threshold)}'; then
+    # Check windowed memory
+    if [[ "$mem_windowed" != "N/A" ]]; then
+        mem_to_check="$mem_windowed"
+        if awk -v mem="$mem_windowed" -v threshold="$MEMORY_IDLE_THRESHOLD" 'BEGIN {exit !(mem < threshold)}'; then
+            windowed_idle=true
+        fi
+    fi
+
+    # Decision logic:
+    # - If we have windowed data, use it for primary decision
+    # - But if windowed is IDLE and current is ACTIVE, flag as currently active
+    if [[ "$mem_windowed" != "N/A" ]]; then
+        if [[ "$windowed_idle" == "true" ]]; then
+            if [[ "$instant_idle" == "false" && "$instant_mem" != "N/A" ]]; then
+                # Average is idle but currently active
+                if [[ "$VERBOSE" == "true" ]]; then
+                    log_warning "Memory average is IDLE (${mem_windowed}%) but currently ACTIVE (${instant_mem}%)"
+                fi
+                mem_result="ACTIVE"
+            else
+                # Both average and current are idle
+                if [[ "$VERBOSE" == "true" ]]; then
+                    log_info "Memory usage is IDLE (avg: ${mem_windowed}%, current: ${instant_mem}%)"
+                fi
+                mem_result="IDLE"
+                ((idle_criteria_met++))
+            fi
+        else
+            # Windowed average is active
             if [[ "$VERBOSE" == "true" ]]; then
-                log_success "Memory usage is IDLE (< ${MEMORY_IDLE_THRESHOLD}%)"
+                log_warning "Memory usage is ACTIVE (avg: ${mem_windowed}%)"
+            fi
+            mem_result="ACTIVE"
+        fi
+    else
+        # No windowed data, use instant only
+        if [[ "$instant_idle" == "true" ]]; then
+            if [[ "$VERBOSE" == "true" ]]; then
+                log_info "Memory usage is IDLE (${instant_mem}%)"
             fi
             mem_result="IDLE"
             ((idle_criteria_met++))
         else
             if [[ "$VERBOSE" == "true" ]]; then
-                log_warning "Memory usage is ACTIVE (>= ${MEMORY_IDLE_THRESHOLD}%)"
+                log_warning "Memory usage is ACTIVE (${instant_mem}%)"
             fi
             mem_result="ACTIVE"
         fi
@@ -1060,7 +1142,7 @@ else
     # Compare against threshold
     if awk -v rate="$api_rate" -v threshold="$APISERVER_IDLE_THRESHOLD" 'BEGIN {exit !(rate < threshold)}'; then
         if [[ "$VERBOSE" == "true" ]]; then
-            log_success "API server request rate is IDLE (< ${APISERVER_IDLE_THRESHOLD} req/sec)"
+            log_info "API server request rate is IDLE (< ${APISERVER_IDLE_THRESHOLD} req/sec)"
         fi
         api_result="IDLE"
         ((idle_criteria_met++))
@@ -1084,57 +1166,71 @@ fi
 if [[ "$CHECK_ML_NODES" == "true" ]] && [[ "$VERBOSE" == "true" ]]; then
     echo "--- GPU/ML Node Detection ---"
 
-    # Get GPU information
-    gpu_info=$(get_gpu_info)
-    gpu_nodes=$(echo "$gpu_info" | cut -d':' -f1)
-    gpu_node_count=$(echo "$gpu_info" | cut -d':' -f2)
-    gpu_machines=$(echo "$gpu_info" | cut -d':' -f3)
-    gpu_machine_count=$(echo "$gpu_info" | cut -d':' -f4)
+    # Get all GPU node data in one call (format: name|vendor|gpu_count|instance_type)
+    gpu_node_data=$(get_all_gpu_node_data)
 
     # Display GPU detection results
-    if [[ "$gpu_nodes" != "N/A" ]]; then
-        echo "GPU Nodes Found: $gpu_node_count"
-        while IFS= read -r node; do
-            if [[ -n "$node" ]]; then
-                gpu_capacity=$(oc get node "$node" -o json 2>/dev/null | \
-                    jq -r '.status.capacity["nvidia.com/gpu"] // .status.capacity["amd.com/gpu"] // "0"' 2>/dev/null)
-                gpu_type_detected=$(oc get node "$node" -o json 2>/dev/null | \
-                    jq -r 'if .status.capacity["nvidia.com/gpu"] != null then "NVIDIA" elif .status.capacity["amd.com/gpu"] != null then "AMD" else "Unknown" end' 2>/dev/null)
-                echo "  $node: $gpu_capacity x $gpu_type_detected GPU(s)"
-            fi
-        done <<< "$gpu_nodes"
+    if [[ "$gpu_node_data" != "N/A" ]]; then
+        # Count nodes and build flavor summary
+        gpu_node_count=$(echo "$gpu_node_data" | wc -l)
+        gpu_flavors=$(echo "$gpu_node_data" | awk -F'|' '{print $2"("$4")"}' | sort -u | tr '\n' ',' | sed 's/,$//')
 
+        echo "GPU Nodes Found: $gpu_node_count ($gpu_flavors)"
         echo ""
         echo "GPU Node Resource Usage:"
 
-        # Get instant GPU node usage
-        gpu_usage=$(get_gpu_node_usage)
-        if [[ "$gpu_usage" != "N/A" ]]; then
-            gpu_cpu_instant=$(echo "$gpu_usage" | cut -d',' -f1 | sed 's/%CPU//')
-            gpu_mem_instant=$(echo "$gpu_usage" | cut -d',' -f2 | sed 's/%MEM//')
-            echo "  Current: CPU ${gpu_cpu_instant}%, Memory ${gpu_mem_instant}%"
-        fi
+        # Display per-node usage
+        while IFS='|' read -r node_name gpu_vendor gpu_count instance_type; do
+            if [[ -n "$node_name" ]]; then
+                # Get current usage for this node
+                node_stats=$(timeout 10 oc adm top node "$node_name" --no-headers 2>/dev/null || echo "")
+                if [[ -n "$node_stats" ]]; then
+                    node_cpu=$(echo "$node_stats" | awk '{gsub(/%/,"",$3); print $3}')
+                    node_mem=$(echo "$node_stats" | awk '{gsub(/%/,"",$5); print $5}')
 
-        # Get time-windowed GPU node usage
-        if [[ $TIME_WINDOW_MINUTES -gt 0 ]]; then
-            gpu_cpu_windowed=$(get_gpu_node_cpu_usage_windowed)
-            gpu_mem_windowed=$(get_gpu_node_memory_usage_windowed)
+                    echo "  $node_name ($gpu_vendor x${gpu_count}, $instance_type):"
+                    echo "    Current: CPU ${node_cpu}%, Memory ${node_mem}%"
 
-            if [[ "$gpu_cpu_windowed" != "N/A" ]] && [[ "$gpu_mem_windowed" != "N/A" ]]; then
-                echo "  Average (last ${TIME_WINDOW_MINUTES} min): CPU ${gpu_cpu_windowed}%, Memory ${gpu_mem_windowed}%"
+                    # Get time-windowed usage for this specific node if enabled
+                    if [[ $TIME_WINDOW_MINUTES -gt 0 ]]; then
+                        # CPU windowed for this node
+                        local window="${TIME_WINDOW_MINUTES}m"
+                        local cpu_query="(1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",instance=~\"${node_name}.*\"}[${window}]))) * 100"
+                        local cpu_windowed=$(query_prometheus "$cpu_query")
+
+                        # Memory windowed for this node
+                        local mem_query="(1 - avg_over_time((avg(node_memory_MemAvailable_bytes{instance=~\"${node_name}.*\"}) / avg(node_memory_MemTotal_bytes{instance=~\"${node_name}.*\"}))[${window}:])) * 100"
+                        local mem_windowed=$(query_prometheus "$mem_query")
+
+                        if [[ "$cpu_windowed" != "N/A" ]] && [[ "$mem_windowed" != "N/A" ]]; then
+                            cpu_windowed=$(awk -v val="$cpu_windowed" 'BEGIN {printf "%.2f", val}')
+                            mem_windowed=$(awk -v val="$mem_windowed" 'BEGIN {printf "%.2f", val}')
+                            echo "    Average (last ${TIME_WINDOW_MINUTES} min): CPU ${cpu_windowed}%, Memory ${mem_windowed}%"
+                        fi
+                    fi
+                else
+                    echo "  $node_name ($gpu_vendor x${gpu_count}, $instance_type): Unable to get metrics"
+                fi
             fi
-        fi
+        done <<< "$gpu_node_data"
 
-    elif [[ "$gpu_machines" != "N/A" ]]; then
-        echo "GPU Machines Found (by pattern): $gpu_machine_count"
-        while IFS= read -r machine; do
-            if [[ -n "$machine" ]]; then
-                echo "  $machine"
-            fi
-        done <<< "$gpu_machines"
-        log_info "GPU machines exist but nodes may not be ready/running"
     else
-        log_info "No GPU nodes or machines found"
+        # Check for GPU machines if no GPU nodes found
+        gpu_machine_info=$(get_gpu_machines)
+        gpu_machines=$(echo "$gpu_machine_info" | cut -d':' -f1)
+        gpu_machine_count=$(echo "$gpu_machine_info" | cut -d':' -f2)
+
+        if [[ "$gpu_machines" != "N/A" ]]; then
+            echo "GPU Machines Found (by pattern): $gpu_machine_count"
+            while IFS= read -r machine; do
+                if [[ -n "$machine" ]]; then
+                    echo "  $machine"
+                fi
+            done <<< "$gpu_machines"
+            log_info "GPU machines exist but nodes may not be ready/running"
+        else
+            log_info "No GPU nodes or machines found"
+        fi
     fi
 
     echo ""
@@ -1173,7 +1269,7 @@ if [[ "$CHECK_ML_NODES" == "true" ]] && [[ "$VERBOSE" == "true" ]]; then
         # Check if idle
         if [[ -n "$ml_cpu_to_check" ]]; then
             if awk -v cpu="$ml_cpu_to_check" -v threshold="$CPU_IDLE_THRESHOLD" 'BEGIN {exit !(cpu < threshold)}'; then
-                log_success "ML nodes are IDLE"
+                log_info "ML nodes are IDLE"
             else
                 log_warning "ML nodes are ACTIVE (expensive resources in use!)"
             fi
@@ -1240,7 +1336,7 @@ else
     # Determine if operators indicate idle state
     if [[ $operator_age_days -ge $OPERATOR_IDLE_AGE_DAYS ]] && [[ $operator_events -lt 5 ]]; then
         if [[ "$VERBOSE" == "true" ]]; then
-            log_success "Operators are IDLE (age: ${operator_age_days}d, low activity)"
+            log_info "Operators are IDLE (age: ${operator_age_days}d, low activity)"
         fi
         operator_result="IDLE"
         ((idle_criteria_met++))
@@ -1269,7 +1365,7 @@ if [[ "$VERBOSE" == "true" ]]; then
     timeout 10 oc get events -A --sort-by='.lastTimestamp' 2>/dev/null | tail -5 || echo "Could not retrieve events"
 
     if [[ $recent_events -eq 0 ]]; then
-        log_success "No recent pod activity"
+        log_info "No recent pod activity"
     else
         log_warning "Recent pod activity detected - it does not imply the cluster is being actively used"
     fi
