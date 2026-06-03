@@ -143,8 +143,8 @@ log_info() {
     echo -e "${BLUE}[INFO]${NC} $1" >&2
 }
 
-log_info() {
-    echo -e "${GREEN}[IDLE]${NC} $1" >&2
+log_success() {
+    echo -e "${GREEN}[SUCCESS]${NC} $1" >&2
 }
 
 log_warning() {
