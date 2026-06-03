@@ -1163,11 +1163,11 @@ if [[ "$VERBOSE" == "true" ]]; then
 fi
 
 # === CHECK 4: GPU/ML Node Detection (informational only) ===
+# Get all GPU node data once for both display and export
+gpu_node_data=$(get_all_gpu_node_data)
+
 if [[ "$CHECK_ML_NODES" == "true" ]] && [[ "$VERBOSE" == "true" ]]; then
     echo "--- GPU/ML Node Detection ---"
-
-    # Get all GPU node data in one call (format: name|vendor|gpu_count|instance_type)
-    gpu_node_data=$(get_all_gpu_node_data)
 
     # Display GPU detection results
     if [[ "$gpu_node_data" != "N/A" ]]; then
@@ -1181,10 +1181,11 @@ if [[ "$CHECK_ML_NODES" == "true" ]] && [[ "$VERBOSE" == "true" ]]; then
 
         # Display per-node usage
         while IFS='|' read -r node_name gpu_vendor gpu_count instance_type; do
-            # Trim whitespace from variables
-            node_name=$(echo "$node_name" | xargs)
-            gpu_vendor=$(echo "$gpu_vendor" | xargs)
-            instance_type=$(echo "$instance_type" | xargs)
+            # Trim leading/trailing whitespace from variables
+            node_name=$(echo "$node_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            gpu_vendor=$(echo "$gpu_vendor" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            gpu_count=$(echo "$gpu_count" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            instance_type=$(echo "$instance_type" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
             if [[ -n "$node_name" ]]; then
                 # Get current usage for this node
@@ -1391,39 +1392,89 @@ CLUSTER_NAME=$(oc whoami --show-server 2>/dev/null || echo "Unknown")
 TIMESTAMP=$(date -Iseconds)
 TIMESTAMP_HUMAN=$(date)
 
-# Collect GPU information for export
-GPU_INFO=$(get_gpu_info)
-GPU_NODES_LIST=$(echo "$GPU_INFO" | cut -d':' -f1)
-GPU_NODE_COUNT=$(echo "$GPU_INFO" | cut -d':' -f2)
-GPU_MACHINES_LIST=$(echo "$GPU_INFO" | cut -d':' -f3)
-GPU_MACHINE_COUNT=$(echo "$GPU_INFO" | cut -d':' -f4)
+# Collect GPU information for export (reuse cached data from CHECK 4)
+# gpu_node_data was already collected above
 
 # Determine if cluster has GPU nodes
-if [[ "$GPU_NODES_LIST" != "N/A" ]]; then
+if [[ "$gpu_node_data" != "N/A" ]]; then
     HAS_GPU_NODES="true"
-    GPU_FLAVORS=$(get_gpu_flavors)
-    GPU_NODE_AGE=$(get_gpu_node_age)
+    GPU_NODE_COUNT=$(echo "$gpu_node_data" | wc -l)
+    GPU_FLAVORS=$(echo "$gpu_node_data" | awk -F'|' '{print $2"("$4")"}' | sort -u | tr '\n' ',' | sed 's/,$//')
 
-    # Get GPU node usage if available
-    GPU_NODE_USAGE=$(get_gpu_node_usage)
-    if [[ "$GPU_NODE_USAGE" != "N/A" ]]; then
-        GPU_CPU_CURRENT=$(echo "$GPU_NODE_USAGE" | cut -d',' -f1 | sed 's/%CPU//')
-        GPU_MEM_CURRENT=$(echo "$GPU_NODE_USAGE" | cut -d',' -f2 | sed 's/%MEM//')
+    # Get average GPU usage across all GPU nodes (for backward compatibility with CSV/JSON export)
+    gpu_cpu_sum=0
+    gpu_mem_sum=0
+    gpu_count_nodes=0
+
+    while IFS='|' read -r node_name gpu_vendor gpu_count instance_type; do
+        node_name=$(echo "$node_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        if [[ -n "$node_name" ]]; then
+            node_stats=$(timeout 10 oc adm top node "$node_name" --no-headers 2>/dev/null || echo "")
+            if [[ -n "$node_stats" ]]; then
+                node_cpu=$(echo "$node_stats" | awk '{gsub(/%/,"",$3); print $3}')
+                node_mem=$(echo "$node_stats" | awk '{gsub(/%/,"",$5); print $5}')
+                gpu_cpu_sum=$(awk -v sum="$gpu_cpu_sum" -v val="$node_cpu" 'BEGIN {print sum + val}')
+                gpu_mem_sum=$(awk -v sum="$gpu_mem_sum" -v val="$node_mem" 'BEGIN {print sum + val}')
+                ((gpu_count_nodes++))
+            fi
+        fi
+    done <<< "$gpu_node_data"
+
+    if [[ $gpu_count_nodes -gt 0 ]]; then
+        GPU_CPU_CURRENT=$(awk -v sum="$gpu_cpu_sum" -v cnt="$gpu_count_nodes" 'BEGIN {printf "%.2f", sum / cnt}')
+        GPU_MEM_CURRENT=$(awk -v sum="$gpu_mem_sum" -v cnt="$gpu_count_nodes" 'BEGIN {printf "%.2f", sum / cnt}')
     else
         GPU_CPU_CURRENT="N/A"
         GPU_MEM_CURRENT="N/A"
     fi
 
-    # Get windowed GPU usage if time window is enabled
+    # Get windowed GPU usage if time window is enabled (average across all GPU nodes)
     if [[ $TIME_WINDOW_MINUTES -gt 0 ]]; then
-        GPU_CPU_WINDOWED=$(get_gpu_node_cpu_usage_windowed)
-        GPU_MEM_WINDOWED=$(get_gpu_node_memory_usage_windowed)
+        gpu_cpu_windowed_sum=0
+        gpu_mem_windowed_sum=0
+        gpu_windowed_count=0
+
+        # Temporarily disable verbose for export queries
+        saved_verbose_export="$VERBOSE"
+        VERBOSE=false
+
+        while IFS='|' read -r node_name gpu_vendor gpu_count instance_type; do
+            node_name=$(echo "$node_name" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if [[ -n "$node_name" ]]; then
+                window="${TIME_WINDOW_MINUTES}m"
+                cpu_query="(1 - avg(rate(node_cpu_seconds_total{mode=\"idle\",instance=~\"${node_name}.*\"}[${window}]))) * 100"
+                cpu_windowed=$(query_prometheus "$cpu_query")
+
+                mem_query="(1 - avg_over_time((avg(node_memory_MemAvailable_bytes{instance=~\"${node_name}.*\"}) / avg(node_memory_MemTotal_bytes{instance=~\"${node_name}.*\"}))[${window}:])) * 100"
+                mem_windowed=$(query_prometheus "$mem_query")
+
+                if [[ "$cpu_windowed" != "N/A" ]] && [[ "$mem_windowed" != "N/A" ]]; then
+                    gpu_cpu_windowed_sum=$(awk -v sum="$gpu_cpu_windowed_sum" -v val="$cpu_windowed" 'BEGIN {print sum + val}')
+                    gpu_mem_windowed_sum=$(awk -v sum="$gpu_mem_windowed_sum" -v val="$mem_windowed" 'BEGIN {print sum + val}')
+                    ((gpu_windowed_count++))
+                fi
+            fi
+        done <<< "$gpu_node_data"
+
+        # Restore verbose setting
+        VERBOSE="$saved_verbose_export"
+
+        if [[ $gpu_windowed_count -gt 0 ]]; then
+            GPU_CPU_WINDOWED=$(awk -v sum="$gpu_cpu_windowed_sum" -v cnt="$gpu_windowed_count" 'BEGIN {printf "%.2f", sum / cnt}')
+            GPU_MEM_WINDOWED=$(awk -v sum="$gpu_mem_windowed_sum" -v cnt="$gpu_windowed_count" 'BEGIN {printf "%.2f", sum / cnt}')
+        else
+            GPU_CPU_WINDOWED="N/A"
+            GPU_MEM_WINDOWED="N/A"
+        fi
     else
         GPU_CPU_WINDOWED="N/A"
         GPU_MEM_WINDOWED="N/A"
     fi
+
+    GPU_NODE_AGE="N/A"  # We don't track this anymore
 else
     HAS_GPU_NODES="false"
+    GPU_NODE_COUNT=0
     GPU_FLAVORS="N/A"
     GPU_NODE_AGE="N/A"
     GPU_CPU_CURRENT="N/A"
