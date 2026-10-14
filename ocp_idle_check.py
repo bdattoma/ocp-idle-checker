@@ -38,6 +38,14 @@ A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
              threshold.  N/A (not counted) when no controller pods exist
              anywhere on the cluster.
 
+Every criterion also exports a threshold ratio - its hottest reading as a
+fraction of the level that fires it, so >= 1 means it fired - and the
+verdict reports the boundary criterion: for an IDLE verdict the hottest
+IDLE vote (the one whose flip would eat the quorum), for an ACTIVE verdict
+the hottest criterion overall.  It rides the JSON report (criteria.driver
+plus each criterion's threshold_ratio), two CSV columns, and an annotation
+on the quiet STATUS line, whose "STATUS: <verdict>" prefix stays intact.
+
 The variance parameters (peak threshold, ratio) are fleet calibration
 knobs exposed as command-line flags; the defaults are provisional.  All
 three variance rules share one law, in each criterion's native unit
@@ -274,7 +282,6 @@ class Config:
     gpu_variance_ratio: float
     api_variance_ratio: float
     verbose: bool
-    debug_probe: bool
     token: str
     csv_path: Path | None
     json_path: Path | None
@@ -395,11 +402,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         metavar="N",
         help="API variance rule: burst multiple the peak must clear at a baseline of 50 req/s; quieter baselines require more (default: %(default)s)",
     )
-    parser.add_argument(
-        "--debug-probe",
-        action="store_true",
-        help="accepted for compatibility; criteria detail is always exported now",
-    )
     parser.add_argument("-q", "--quiet", action="store_true", help="minimal output")
     parser.add_argument("--no-ml-check", action="store_true", help="skip the ML node check")
     args = parser.parse_args(argv)
@@ -422,7 +424,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         gpu_variance_ratio=args.gpu_variance_ratio,
         api_variance_ratio=args.api_variance_ratio,
         verbose=not args.quiet,
-        debug_probe=args.debug_probe,
         token=args.token,
         csv_path=args.csv,
         json_path=args.json,
@@ -985,7 +986,8 @@ def summarize_variance(per_node: list[VarianceStats]) -> VarianceStats:
 
 @dataclass(frozen=True)
 class CheckOutcome:
-    """One criterion's verdict plus its criteria JSON entry."""
+    """One criterion's verdict plus its detail entry; the report projects the
+    entry's headline fields into the summary `criteria` section."""
 
     result: str  # IDLE | ACTIVE | UNKNOWN | N/A
     entry: dict[str, Any]
@@ -1022,6 +1024,77 @@ def _variance_entry(
     return entry
 
 
+# === THRESHOLD RATIO =======================================================
+
+
+def _threshold_ratio(value: float, threshold: float) -> float:
+    """`value` as a fraction of the level that fires it (>= 1 means it fired,
+    exact-boundary strictness aside).  A zero threshold is a degenerate
+    config no finite ratio expresses; any positive value reads as
+    unboundedly over it."""
+    if threshold > 0:
+        return value / threshold
+    return math.inf if value > 0 else 0.0
+
+
+def _variance_threshold_ratio(stats: VarianceStats, peak_threshold: float | None) -> float | None:
+    """A variance evaluation's threshold ratio: the peak as a fraction of the
+    level that fires it - the absolute peak threshold (when the rule has one)
+    and the baseline-scaled required peak, whichever is closer.  None when
+    there is no data.  A floorless rule on a zero baseline (required peak 0)
+    fires on any positive peak, which no finite ratio expresses."""
+    if stats.points == 0:
+        return None
+    heat: float = 0.0
+    if peak_threshold is not None:
+        heat = _threshold_ratio(stats.peak, peak_threshold)
+    required = stats.required_peak
+    if required is None:
+        return heat
+    if required <= 0:
+        # A floorless rule on a zero baseline demands only a positive peak;
+        # no finite ratio expresses firing on "anything above zero".
+        return math.inf if stats.peak > 0 else heat
+    return max(heat, stats.peak / required)
+
+
+CRITERIA_KEYS = ("cpu", "memory", "api_server", "gpu", "operators")
+CRITERIA_LABELS = {
+    "cpu": "CPU",
+    "memory": "Memory",
+    "api_server": "API Server",
+    "gpu": "GPU",
+    "operators": "Operators",
+}
+
+# The fields each criterion's entry keeps in the report's `criteria` section.
+# Renderers that print `criteria` verbatim - the Jenkins report's Metrics
+# column - must stay compact, so the entry is projected down to its headline
+# fields; the diagnostics behind them are not exported.
+CRITERIA_SUMMARY_FIELDS: dict[str, frozenset[str]] = {
+    "cpu": frozenset({"result", "value", "threshold_ratio"}),
+    "memory": frozenset({"result", "value", "threshold_ratio"}),
+    "api_server": frozenset({"result", "value", "threshold_ratio"}),
+    "gpu": frozenset({"result", "value", "threshold_ratio"}),
+    "operators": frozenset({"result", "value", "threshold_ratio", "age_days", "events"}),
+}
+
+
+def criteria_summary(key: str, entry: dict[str, Any]) -> dict[str, Any]:
+    """The headline view of a criterion's entry for the report's `criteria`
+    section - everything a renderer printing `criteria` verbatim should see."""
+    keep = CRITERIA_SUMMARY_FIELDS[key]
+    return {k: v for k, v in entry.items() if k in keep}
+
+
+def format_threshold_ratio(heat: float) -> str:
+    """A threshold ratio as a percentage of the level that fires it; the
+    floorless zero-baseline fire (no finite ratio) reads as 999%+."""
+    if math.isinf(heat):
+        return "999%+"
+    return f"{heat * 100:.0f}%"
+
+
 # === CRITERIA ==============================================================
 
 
@@ -1039,7 +1112,7 @@ def check_cpu(
 ) -> CheckOutcome:
     """CPU criterion: variance rule on 15-minute windows, with the legacy
     window-average as fallback and the one-directional instant override."""
-    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None}
+    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None, "threshold_ratio": None}
     stats: VarianceStats | None = None
     windowed: float | None = None
     per_node: list[VarianceStats] = []
@@ -1103,6 +1176,21 @@ def check_cpu(
         active = True
         instant_override = True
 
+    # Threshold ratio: the reading closest to firing, as a fraction of the
+    # level that fires it.  Every firing path counts - the hottest node's
+    # windows against the peak threshold and its own required peak, the
+    # legacy window average, and the instant accusation - so the max over
+    # nodes and paths is the heat.
+    heat: float | None = None
+    if per_node:
+        heat = max(_variance_threshold_ratio(s, cfg.cpu_peak_threshold) for s in per_node)
+    elif windowed is not None:
+        heat = _threshold_ratio(windowed, cfg.cpu_idle_threshold)
+    if instant_cpu is not None:
+        instant_heat = _threshold_ratio(instant_cpu, cfg.cpu_idle_threshold)
+        heat = instant_heat if heat is None else max(heat, instant_heat)
+    entry["threshold_ratio"] = _round2(heat)
+
     value = stats.peak if stats is not None else (windowed if windowed is not None else instant_cpu)
     entry["result"] = "ACTIVE" if active else "IDLE"
     entry["value"] = fmt2(value)
@@ -1114,7 +1202,7 @@ def check_cpu(
 
 def check_memory(cfg: Config, prom: PrometheusClient, instant_mem: float | None) -> CheckOutcome:
     """Memory criterion: legacy window average with instant override."""
-    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None}
+    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None, "threshold_ratio": None}
     windowed: float | None = None
     if cfg.time_window_minutes > 0:
         windowed = prom.query(MEMORY_WINDOW_AVERAGE_QUERY.format(minutes=cfg.time_window_minutes))
@@ -1149,6 +1237,13 @@ def check_memory(cfg: Config, prom: PrometheusClient, instant_mem: float | None)
         active = True
         instant_override = True
 
+    # Threshold ratio: window average and instant accusation both count
+    # (each is a firing path); the hotter is the heat.
+    heat = _threshold_ratio(windowed, cfg.memory_idle_threshold) if windowed is not None else None
+    if instant_mem is not None:
+        instant_heat = _threshold_ratio(instant_mem, cfg.memory_idle_threshold)
+        heat = instant_heat if heat is None else max(heat, instant_heat)
+    entry["threshold_ratio"] = _round2(heat)
     entry["result"] = "ACTIVE" if active else "IDLE"
     entry["value"] = fmt2(windowed if windowed is not None else instant_mem)
     entry["instant"] = instant_mem
@@ -1160,7 +1255,7 @@ def check_memory(cfg: Config, prom: PrometheusClient, instant_mem: float | None)
 def check_api(cfg: Config, prom: PrometheusClient) -> CheckOutcome:
     """API criterion: window-average rate against the threshold, plus a
     variance detector (peak vs median of 15-minute windows)."""
-    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None}
+    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None, "threshold_ratio": None}
     if cfg.time_window_minutes > 0:
         avg = prom.query(API_WINDOW_RATE_QUERY.format(minutes=cfg.time_window_minutes))
         start_s, end_s = window_bounds(cfg)
@@ -1184,11 +1279,18 @@ def check_api(cfg: Config, prom: PrometheusClient) -> CheckOutcome:
     active = (avg is not None and avg >= cfg.api_threshold) or (
         stats is not None and stats.variance_exceeded
     )
-    entry["result"] = "ACTIVE" if active else "IDLE"
-    entry["value"] = fmt2(avg)
+    # Threshold ratio: the windowed average against the request threshold,
+    # and the variance peak against its baseline-scaled requirement (the
+    # API rule has no absolute peak branch).
+    heat = _threshold_ratio(avg, cfg.api_threshold) if avg is not None else None
     if stats is not None:
         entry.update(_variance_numbers(stats, prefix="variance_"))
         entry["variance_active"] = stats.variance_exceeded
+        variance_heat = _variance_threshold_ratio(stats, None)
+        heat = variance_heat if heat is None else max(heat, variance_heat)
+    entry["result"] = "ACTIVE" if active else "IDLE"
+    entry["value"] = fmt2(avg)
+    entry["threshold_ratio"] = _round2(heat)
     return CheckOutcome(entry["result"], entry, counted=True)
 
 
@@ -1196,7 +1298,7 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode] | No
     """GPU criterion: variance rule on DCGM GPU utilization.  N/A (not
     counted) without GPU nodes or DCGM metrics; UNKNOWN (counted) when the
     node listing itself failed - a failed listing is not an empty one."""
-    entry: dict[str, Any] = {"result": "N/A", "value": None}
+    entry: dict[str, Any] = {"result": "N/A", "value": None, "threshold_ratio": None}
     if gpu_nodes is None:
         entry["result"] = "UNKNOWN"
         entry["reason"] = "node listing failed (oc error or timeout)"
@@ -1252,10 +1354,19 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode] | No
             entry["reason"] = "no DCGM metrics"
             return CheckOutcome("N/A", entry, counted=False)
 
+    # Threshold ratio: the hottest node's peak against the peak threshold
+    # and its own required peak (the fallback path has one pooled
+    # evaluation instead).
+    heat = (
+        max(_variance_threshold_ratio(s, cfg.gpu_peak_threshold) for s in per_node)
+        if per_node
+        else _variance_threshold_ratio(stats, cfg.gpu_peak_threshold)
+    )
     entry["result"] = "ACTIVE" if stats.active else "IDLE"
     entry["value"] = fmt2(stats.peak)
     entry.update(_variance_entry(stats, per_node))
     entry["source"] = source
+    entry["threshold_ratio"] = _round2(heat)
     return CheckOutcome(entry["result"], entry, counted=True)
 
 
@@ -1328,7 +1439,7 @@ def check_operators(cfg: Config, oc: Oc, now: datetime | None = None) -> CheckOu
     pods", and a failed event listing must not read as a quiet cluster.
     """
     now = now or datetime.now(UTC)
-    entry: dict[str, Any] = {"result": "N/A", "age_days": 0}
+    entry: dict[str, Any] = {"result": "N/A", "age_days": 0, "threshold_ratio": None}
 
     always = {ns.strip() for ns in cfg.operator_namespaces.split(",") if ns.strip()}
     excludes = [p.strip() for p in cfg.operator_exclude_prefixes.split(",") if p.strip()]
@@ -1426,6 +1537,17 @@ def check_operators(cfg: Config, oc: Oc, now: datetime | None = None) -> CheckOu
     median_age = statistics.median(ages_days.values())
     idle = median_age >= cfg.operator_age_days and events < OPERATOR_EVENT_THRESHOLD
     entry["result"] = "IDLE" if idle else "ACTIVE"
+    # Threshold ratio: the event count over its threshold, and - inverted -
+    # the age threshold over the median age, because the age rule fires
+    # when controllers are younger than the threshold (younger is hotter).
+    # A median age of exactly zero (everything created this instant) is
+    # hotter than any finite ratio.
+    if median_age > 0:
+        age_heat = _threshold_ratio(cfg.operator_age_days, median_age)
+    else:
+        age_heat = math.inf if cfg.operator_age_days > 0 else 0.0
+    events_heat = _threshold_ratio(events, OPERATOR_EVENT_THRESHOLD)
+    entry["threshold_ratio"] = _round2(max(age_heat, events_heat))
     entry["age_days"] = round(median_age, 2)
     entry["units"] = [
         {"namespace": ns, "kind": kind, "name": name, "age_days": round(age, 2)}
@@ -1451,6 +1573,31 @@ def compute_verdict(outcomes: list[CheckOutcome]) -> tuple[int, int, int, str, i
     status = "IDLE" if met >= threshold else "ACTIVE"
     exit_code = 1 if status == "IDLE" else 0
     return total, met, threshold, status, exit_code
+
+
+def threshold_focus(outcomes: list[CheckOutcome], status: str) -> dict[str, Any] | None:
+    """The criterion sitting at the verdict's boundary, as a threshold ratio:
+    for an IDLE verdict the hottest IDLE vote - the one whose flip would eat
+    the quorum - and for an ACTIVE verdict the hottest criterion overall.
+    `quorum_driven` marks an ACTIVE verdict where nothing fired: UNKNOWN
+    votes deprived the quorum.  None when no criterion has a ratio (every
+    vote UNKNOWN or N/A)."""
+    candidates = [
+        (key, outcome)
+        for key, outcome in zip(CRITERIA_KEYS, outcomes, strict=True)
+        if outcome.entry.get("threshold_ratio") is not None
+        and (status == "ACTIVE" or outcome.result == "IDLE")
+    ]
+    if not candidates:
+        return None
+    key, outcome = max(candidates, key=lambda item: item[1].entry["threshold_ratio"])
+    heat = outcome.entry["threshold_ratio"]
+    return {
+        "criterion": key,
+        "label": CRITERIA_LABELS[key],
+        "threshold_ratio": heat,
+        "quorum_driven": status == "ACTIVE" and heat < 1.0,
+    }
 
 
 # === INFORMATIONAL (non-voting) SECTIONS ===================================
@@ -1717,12 +1864,6 @@ def run(argv: list[str] | None = None) -> int:
         log_info(f"Time window: {cfg.time_window_minutes} minutes")
         log_info(f"Event history: {cfg.event_history_minutes} minutes")
 
-    if cfg.debug_probe:
-        log_info(
-            "--debug-probe is accepted for compatibility; the criteria "
-            "detail is always included in the JSON export now"
-        )
-
     if shutil.which("oc") is None:
         log_error("oc command not found")
         return 2
@@ -1806,6 +1947,15 @@ def run(argv: list[str] | None = None) -> int:
     # --- Verdict ---
     outcomes = [cpu_outcome, memory_outcome, api_outcome, gpu_outcome, operators_outcome]
     total, met, threshold, status, exit_code = compute_verdict(outcomes)
+    focus = threshold_focus(outcomes, status)
+
+    # `criteria` keeps each criterion's headline fields so renderers that
+    # print it verbatim (the Jenkins report's Metrics column) stay compact;
+    # the diagnostics behind those fields are not exported.
+    criteria: dict[str, Any] = {"total": total, "met": met, "threshold": threshold}
+    for key, outcome in zip(CRITERIA_KEYS, outcomes, strict=True):
+        criteria[key] = criteria_summary(key, outcome.entry)
+    criteria["driver"] = focus
 
     report: dict[str, Any] = {
         "timestamp": now.isoformat(timespec="seconds"),
@@ -1827,16 +1977,7 @@ def run(argv: list[str] | None = None) -> int:
             "gpu_variance_ratio": cfg.gpu_variance_ratio,
             "api_variance_ratio": cfg.api_variance_ratio,
         },
-        "criteria": {
-            "total": total,
-            "met": met,
-            "threshold": threshold,
-            "cpu": cpu_outcome.entry,
-            "memory": memory_outcome.entry,
-            "api_server": api_outcome.entry,
-            "gpu": gpu_outcome.entry,
-            "operators": operators_outcome.entry,
-        },
+        "criteria": criteria,
         "gpu": gpu_section,
     }
 
@@ -1844,10 +1985,19 @@ def run(argv: list[str] | None = None) -> int:
     if cfg.verbose:
         print("-" * 40, file=sys.stderr)
         log_info(f"Idle criteria met: {met} / {total} (threshold: {threshold})")
-        for name, outcome in zip(
-            ("cpu", "memory", "api_server", "gpu", "operators"), outcomes, strict=True
-        ):
+        for name, outcome in zip(CRITERIA_KEYS, outcomes, strict=True):
             log_info(f"  {name}: {outcome.result}")
+        if focus is not None:
+            ratio = format_threshold_ratio(focus["threshold_ratio"])
+            if status == "IDLE":
+                log_info(f"Closest to active: {focus['label']} at {ratio} of threshold")
+            elif focus["quorum_driven"]:
+                log_info(
+                    f"Most active: {focus['label']} at {ratio} of threshold "
+                    "- no criterion fired; UNKNOWN votes deprived the quorum"
+                )
+            else:
+                log_info(f"Most active: {focus['label']} at {ratio} of threshold")
     # node_items None = listing failed = GPU/ML presence unknown; "unknown"
     # is not "no expensive nodes", so the cleanup warning fires on it too.
     if status == "IDLE" and (gpu_nodes or ml_found or node_items is None):
@@ -1870,7 +2020,18 @@ def run(argv: list[str] | None = None) -> int:
         print(f"API Server: {api_outcome.result}")
     print(f"GPU: {gpu_outcome.result}")
     print(f"Operators: {operators_outcome.result}")
-    print(f"STATUS: {status}")
+    # The STATUS line keeps its "STATUS: <verdict>" prefix - parsers key on
+    # it - and gains the boundary criterion as an annotation.
+    note = ""
+    if focus is not None:
+        ratio = format_threshold_ratio(focus["threshold_ratio"])
+        if status == "IDLE":
+            note = f" (closest to active: {focus['label']} at {ratio} of threshold)"
+        elif focus["quorum_driven"]:
+            note = f" (UNKNOWN-driven; {focus['label']} at {ratio} of threshold)"
+        else:
+            note = f" ({focus['label']} at {ratio} of threshold)"
+    print(f"STATUS: {status}{note}")
 
     if cfg.csv_path is not None:
         export_csv(report, cfg.csv_path)

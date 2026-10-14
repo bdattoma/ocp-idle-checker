@@ -186,7 +186,7 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "API Server: IDLE",
         "GPU: N/A",
         "Operators: IDLE",
-        "STATUS: IDLE",
+        "STATUS: IDLE (closest to active: Operators at 58% of threshold)",
     ]
 
     report = json.loads(json_path.read_text())
@@ -227,14 +227,24 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "api_server",
         "gpu",
         "operators",
+        "driver",
     ]
     assert (criteria["total"], criteria["met"], criteria["threshold"]) == (4, 4, 3)
     assert criteria["cpu"]["result"] == "IDLE"
-    assert criteria["cpu"]["source"] == "variance over 15m windows"
-    assert criteria["cpu"]["peak"] == 2.0
+    assert criteria["cpu"]["threshold_ratio"] == 0.13
     assert criteria["operators"]["age_days"] == 12.0
     assert criteria["operators"]["events"] == 0
     assert criteria["gpu"]["result"] == "N/A"
+    assert criteria["driver"] == {
+        "criterion": "operators",
+        "label": "Operators",
+        "threshold_ratio": 0.58,
+        "quorum_driven": False,
+    }
+    # The summary keeps only the headline fields, so renderers printing
+    # `criteria` verbatim (the Jenkins report's Metrics column) stay compact.
+    assert set(criteria["cpu"]) == {"result", "value", "threshold_ratio"}
+    assert set(criteria["operators"]) == {"result", "age_days", "events", "threshold_ratio"}
     # The token came from `oc whoami -t`; no service-account token was created.
     assert CREATE_TOKEN_ARGS not in calls
 
@@ -263,12 +273,17 @@ def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
     assert exit_code == 0
-    assert capsys.readouterr().out.splitlines()[-1] == "STATUS: ACTIVE"
+    assert (
+        capsys.readouterr().out.splitlines()[-1]
+        == "STATUS: ACTIVE (Operators at 350% of threshold)"
+    )
 
-    criteria = json.loads(json_path.read_text())["criteria"]
+    report = json.loads(json_path.read_text())
+    criteria = report["criteria"]
     assert (criteria["total"], criteria["met"]) == (4, 2)
     assert criteria["cpu"]["result"] == "ACTIVE"
-    assert criteria["cpu"]["peak"] == 50.0
+    # The burst cleared its firing level: the ratio sits past 1.0.
+    assert criteria["cpu"]["threshold_ratio"] > 1
     assert criteria["memory"]["result"] == "IDLE"
     assert criteria["api_server"]["result"] == "IDLE"
     assert criteria["operators"]["result"] == "ACTIVE"
@@ -297,15 +312,16 @@ def test_operator_listing_failure_reports_unknown(monkeypatch, prom_server, tmp_
         "API Server: IDLE",
         "GPU: N/A",
         "Operators: UNKNOWN",
-        "STATUS: IDLE",
+        "STATUS: IDLE (closest to active: Memory at 29% of threshold)",
     ]
 
-    criteria = json.loads(json_path.read_text())["criteria"]
+    report = json.loads(json_path.read_text())
+    criteria = report["criteria"]
     assert (criteria["total"], criteria["met"], criteria["threshold"]) == (3, 3, 2)
     assert criteria["operators"] == {
         "result": "UNKNOWN",
         "age_days": 0,
-        "reason": "pod listing failed (oc error or timeout)",
+        "threshold_ratio": None,
     }
 
 
@@ -334,7 +350,7 @@ def test_node_listing_failure_reports_gpu_unknown(monkeypatch, prom_server, tmp_
         "API Server: IDLE",
         "GPU: UNKNOWN",
         "Operators: IDLE",
-        "STATUS: IDLE",
+        "STATUS: IDLE (closest to active: Operators at 58% of threshold)",
     ]
 
     report = json.loads(json_path.read_text())
@@ -345,7 +361,7 @@ def test_node_listing_failure_reports_gpu_unknown(monkeypatch, prom_server, tmp_
     assert criteria["gpu"] == {
         "result": "UNKNOWN",
         "value": None,
-        "reason": "node listing failed (oc error or timeout)",
+        "threshold_ratio": None,
     }
     # The report's GPU section records the unknown presence rather than
     # claiming the cluster has no GPU nodes.
@@ -394,7 +410,8 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
     # Five criteria now; cpu, memory, and api vote IDLE - 3 of 5 is below 80%.
     assert (criteria["total"], criteria["met"], criteria["threshold"]) == (5, 3, 4)
     assert criteria["gpu"]["result"] == "ACTIVE"
-    assert criteria["gpu"]["peak"] == 80.0
+    # The 80% window cleared its firing level: the ratio sits past 1.0.
+    assert criteria["gpu"]["threshold_ratio"] > 1
     gpu = report["gpu"]
     assert gpu["has_gpu_nodes"] is True
     assert gpu["node_count"] == 1
@@ -464,6 +481,53 @@ def test_csv_export_appends_with_header(monkeypatch, prom_server, tmp_path):
     assert lines[1] == lines[2]
     for row in lines[1:]:
         assert len(row.split(",")) == 24
+
+
+def test_unknown_votes_depriving_the_quorum_annotate_status(
+    monkeypatch, prom_server, tmp_path, capsys
+):
+    # CPU and memory read UNKNOWN (Prometheus down for their queries, quiet
+    # instants) and still count; the operators event listing fails, so it is
+    # UNKNOWN and uncounted.  One IDLE vote of three counted - below the
+    # quorum - makes the verdict ACTIVE with nothing fired, and the STATUS
+    # annotation says so instead of implying a hot criterion.
+    url, responses = prom_server
+    monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
+    oc_responses = base_oc_responses(
+        [node_item("node-1"), node_item("node-2"), node_item("node-3")]
+    )
+    oc_responses[("get", "events", "-A", "-o", "json")] = None
+    install_fake_oc(monkeypatch, oc_responses)
+    # Only the API criterion has Prometheus data; the server 404s the
+    # CPU/memory queries, which the client reads as no data.
+    responses[("/api/v1/query", api_avg_query(WINDOW))] = prom_instant_json("5")
+    responses[("/api/v1/query_range", oic.API_RANGE_QUERY)] = prom_range_json(
+        [{"metric": {}, "values": [[i * 900, "5"] for i in range(8)]}]
+    )
+
+    json_path = tmp_path / "report.json"
+    exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
+    assert exit_code == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "CPU: UNKNOWN",
+        "Memory: UNKNOWN",
+        "API Server: IDLE",
+        "GPU: N/A",
+        "Operators: UNKNOWN",
+        "STATUS: ACTIVE (UNKNOWN-driven; API Server at 19% of threshold)",
+    ]
+
+    criteria = json.loads(json_path.read_text())["criteria"]
+    assert (criteria["total"], criteria["met"], criteria["threshold"]) == (3, 1, 2)
+    assert criteria["cpu"]["result"] == "UNKNOWN"
+    assert criteria["memory"]["result"] == "UNKNOWN"
+    assert criteria["operators"]["result"] == "UNKNOWN"
+    assert criteria["driver"] == {
+        "criterion": "api_server",
+        "label": "API Server",
+        "threshold_ratio": 0.19,
+        "quorum_driven": True,
+    }
 
 
 # === BASH SHIM SMOKE TESTS ==================================================

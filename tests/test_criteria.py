@@ -7,6 +7,7 @@ oc CLI is stubbed with FakeOc for the operators criterion.
 
 from __future__ import annotations
 
+import math
 import re
 from datetime import UTC, datetime
 
@@ -1012,6 +1013,191 @@ def test_operators_events_sum_across_scanned_namespaces():
     )
     assert outcome.result == "ACTIVE"
     assert outcome.entry["events"] == 5
+
+
+# === THRESHOLD RATIO ========================================================
+
+
+def test_cpu_threshold_ratio_peak_branch():
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["35", "35", "45"])]})
+    outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == 1.5
+
+
+def test_cpu_threshold_ratio_variance_branch():
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "28"])]})
+    outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(1.09, abs=0.01)
+
+
+def test_cpu_threshold_ratio_idle_below_one():
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["8", "8", "10"])]})
+    outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 2.0)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(0.33, abs=0.01)
+
+
+def test_cpu_threshold_ratio_legacy_fallback():
+    prom = FakeProm(instant={legacy_cpu_query(WINDOW): 25.0})
+    outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(25 / 15, abs=0.01)
+
+
+def test_cpu_threshold_ratio_instant_accuses():
+    outcome = oic.check_cpu(base_config(), FakeProm(), {"node-1"}, 50.0)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(3.33, abs=0.01)
+
+
+def test_cpu_threshold_ratio_instant_override_counts():
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["8", "8", "10"])]})
+    outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 50.0)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["instant_override"] is True
+    assert outcome.entry["threshold_ratio"] == pytest.approx(3.33, abs=0.01)
+
+
+def test_cpu_threshold_ratio_unknown_is_none():
+    outcome = oic.check_cpu(base_config(), FakeProm(), {"node-1"}, 5.0)
+    assert outcome.result == "UNKNOWN"
+    assert outcome.entry["threshold_ratio"] is None
+
+
+def test_cpu_threshold_ratio_max_across_nodes():
+    prom = FakeProm(
+        ranges={
+            oic.CPU_RANGE_QUERY: [
+                make_range_series("node-1", ["2", "2", "16"]),
+                make_range_series("node-2", ["2", "2", "10"]),
+            ]
+        }
+    )
+    outcome = oic.check_cpu(base_config(), prom, {"node-1", "node-2"}, 2.0)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(1.06, abs=0.01)
+
+
+def test_memory_threshold_ratio_windowed():
+    prom = FakeProm(instant={memory_window_query(WINDOW): 20.0})
+    outcome = oic.check_memory(base_config(), prom, None)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(20 / 35, abs=0.01)
+
+
+def test_memory_threshold_ratio_instant_override_counts():
+    prom = FakeProm(instant={memory_window_query(WINDOW): 20.0})
+    outcome = oic.check_memory(base_config(), prom, 50.0)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["instant_override"] is True
+    assert outcome.entry["threshold_ratio"] == pytest.approx(50 / 35, abs=0.01)
+
+
+def test_api_threshold_ratio_variance_branch():
+    prom = FakeProm(
+        instant={api_avg_query(WINDOW): 5.0},
+        ranges={
+            oic.API_RANGE_QUERY: [
+                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["10", "10", "100"])]}
+            ]
+        },
+    )
+    outcome = oic.check_api(base_config(), prom)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(2.58, abs=0.01)
+
+
+def test_api_threshold_ratio_zero_baseline_is_infinite():
+    prom = FakeProm(
+        instant={api_avg_query(WINDOW): 5.0},
+        ranges={
+            oic.API_RANGE_QUERY: [
+                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["0", "0", "0", "5"])]}
+            ]
+        },
+    )
+    outcome = oic.check_api(base_config(), prom)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == math.inf
+
+
+def test_gpu_threshold_ratio():
+    prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["5", "5", "50"])]})
+    outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(1.94, abs=0.01)
+
+
+def test_gpu_threshold_ratio_na_is_none():
+    outcome = oic.check_gpu(base_config(), FakeProm(), [gpu_node()])
+    assert outcome.result == "N/A"
+    assert outcome.entry["threshold_ratio"] is None
+
+
+def test_operators_threshold_ratio_young_controllers():
+    pod = pod_row(*RS_KEY[:2], "ReplicaSet", RS_KEY[2], ts_before(NOW, days=2))
+    rs = rs_row(RS_KEY[0], RS_KEY[2], ts_before(NOW, days=2))
+    outcome = oic.check_operators(base_config(), FakeOc(pods=[pod], replicasets=[rs]), now=NOW)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == 3.5
+
+
+def test_operators_threshold_ratio_events():
+    events = [reconciled_event() for _ in range(6)]
+    outcome = oic.check_operators(
+        base_config(), FakeOc(pods=[old_operator_pod()], events=events), now=NOW
+    )
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(1.2)
+
+
+def test_operators_threshold_ratio_idle():
+    outcome = oic.check_operators(
+        base_config(), FakeOc(pods=[old_operator_pod()], replicasets=[old_operator_rs()]), now=NOW
+    )
+    assert outcome.result == "IDLE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(7 / 12, abs=0.01)
+
+
+def test_operators_threshold_ratio_unknown_is_none():
+    outcome = oic.check_operators(base_config(), FakeOc(pods_failed=True), now=NOW)
+    assert outcome.result == "UNKNOWN"
+    assert outcome.entry["threshold_ratio"] is None
+
+
+def test_threshold_ratio_separates_active_from_idle():
+    # Invariant: ACTIVE implies heat >= 1.0; IDLE implies heat < 1.0. Samples
+    # stay clear of the exact boundary (strict vs non-strict comparisons).
+    peak = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["35", "35", "45"])]})
+    variance = FakeProm(
+        ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "28"])]}
+    )
+    idle_windows = FakeProm(
+        ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["8", "8", "10"])]}
+    )
+    gpu_active = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["5", "5", "50"])]})
+    gpu_idle = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["8", "8", "10"])]})
+    busy_mem = FakeProm(instant={memory_window_query(WINDOW): 40.0})
+    quiet_mem = FakeProm(instant={memory_window_query(WINDOW): 20.0})
+    samples = [
+        oic.check_cpu(base_config(), peak, {"node-1"}, None),
+        oic.check_cpu(base_config(), variance, {"node-1"}, None),
+        oic.check_cpu(base_config(), idle_windows, {"node-1"}, 2.0),
+        oic.check_memory(base_config(), busy_mem, 10.0),
+        oic.check_memory(base_config(), quiet_mem, 30.0),
+        oic.check_gpu(base_config(), gpu_active, [gpu_node()]),
+        oic.check_gpu(base_config(), gpu_idle, [gpu_node()]),
+    ]
+    for outcome in samples:
+        heat = outcome.entry["threshold_ratio"]
+        assert heat is not None
+        if outcome.result == "ACTIVE":
+            assert heat >= 1.0
+        else:
+            assert outcome.result == "IDLE"
+            assert heat < 1.0
 
 
 def test_parse_k8s_timestamp():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 
 import pytest
 
@@ -10,8 +11,8 @@ import ocp_idle_check as oic
 from helpers import base_config
 
 
-def outcome(result: str, counted: bool = True) -> oic.CheckOutcome:
-    return oic.CheckOutcome(result, {"result": result}, counted)
+def outcome(result: str, counted: bool = True, heat: float | None = None) -> oic.CheckOutcome:
+    return oic.CheckOutcome(result, {"result": result, "threshold_ratio": heat}, counted)
 
 
 # === VERDICT ================================================================
@@ -69,6 +70,133 @@ def test_compute_verdict(outcomes, expected):
     assert oic.compute_verdict(outcomes) == expected
 
 
+# === THRESHOLD FOCUS ========================================================
+
+
+def test_threshold_focus_idle_picks_the_hottest_idle_vote():
+    outcomes = [
+        outcome("IDLE", heat=0.33),
+        outcome("IDLE", heat=0.9),
+        outcome("IDLE", heat=0.19),
+        outcome("N/A", counted=False),
+        outcome("ACTIVE", heat=2.5),
+    ]
+    assert oic.threshold_focus(outcomes, "IDLE") == {
+        "criterion": "memory",
+        "label": "Memory",
+        "threshold_ratio": 0.9,
+        "quorum_driven": False,
+    }
+
+
+def test_threshold_focus_active_picks_the_hottest_overall():
+    outcomes = [
+        outcome("IDLE", heat=0.5),
+        outcome("IDLE", heat=0.6),
+        outcome("IDLE", heat=0.7),
+        outcome("N/A", counted=False),
+        outcome("ACTIVE", heat=3.5),
+    ]
+    assert oic.threshold_focus(outcomes, "ACTIVE") == {
+        "criterion": "operators",
+        "label": "Operators",
+        "threshold_ratio": 3.5,
+        "quorum_driven": False,
+    }
+
+
+def test_threshold_focus_marks_quorum_driven_actives():
+    outcomes = [
+        outcome("UNKNOWN"),
+        outcome("UNKNOWN"),
+        outcome("IDLE", heat=0.85),
+        outcome("N/A", counted=False),
+        outcome("IDLE", heat=0.4),
+    ]
+    assert oic.threshold_focus(outcomes, "ACTIVE") == {
+        "criterion": "api_server",
+        "label": "API Server",
+        "threshold_ratio": 0.85,
+        "quorum_driven": True,
+    }
+
+
+def test_threshold_focus_without_any_heat_is_none():
+    outcomes = [outcome("UNKNOWN") for _ in range(5)]
+    assert oic.threshold_focus(outcomes, "IDLE") is None
+    assert oic.threshold_focus(outcomes, "ACTIVE") is None
+
+
+def test_format_threshold_ratio():
+    assert oic.format_threshold_ratio(0.58) == "58%"
+    assert oic.format_threshold_ratio(1.94) == "194%"
+    assert oic.format_threshold_ratio(3.5) == "350%"
+    assert oic.format_threshold_ratio(math.inf) == "999%+"
+
+
+# === CRITERIA SUMMARY =======================================================
+
+
+def test_criteria_summary_keeps_headline_fields_only():
+    # result/value/threshold_ratio stay in `criteria`; the variance
+    # diagnostics behind them are not exported.
+    entry = {
+        "result": "IDLE",
+        "value": 12.48,
+        "threshold_ratio": 0.46,
+        "peak": 12.48,
+        "baseline": 5.41,
+        "source": "variance over 15m windows",
+        "per_node": [{"node": "node-1", "peak": 12.48}],
+    }
+    assert oic.criteria_summary("cpu", entry) == {
+        "result": "IDLE",
+        "value": 12.48,
+        "threshold_ratio": 0.46,
+    }
+
+
+def test_criteria_summary_operators_keeps_age_and_events():
+    entry = {
+        "result": "IDLE",
+        "age_days": 8.1,
+        "events": 0,
+        "threshold_ratio": 0.86,
+        "units": [{"name": "odh-operator"}],
+        "namespaces": ["opendatahub"],
+        "event_window_hours": 48,
+    }
+    assert oic.criteria_summary("operators", entry) == {
+        "result": "IDLE",
+        "age_days": 8.1,
+        "events": 0,
+        "threshold_ratio": 0.86,
+    }
+
+
+def test_criteria_summary_drops_failure_reasons():
+    # A failure's reason is diagnostic detail, not a headline field.
+    entry = {
+        "result": "UNKNOWN",
+        "age_days": 0,
+        "reason": "pod listing failed (oc error or timeout)",
+        "threshold_ratio": None,
+    }
+    assert oic.criteria_summary("operators", entry) == {
+        "result": "UNKNOWN",
+        "age_days": 0,
+        "threshold_ratio": None,
+    }
+
+
+def test_criteria_summary_fields_cover_every_criterion():
+    # A criterion added without summary fields would leak its diagnostics
+    # into every verbatim `criteria` renderer.
+    assert set(oic.CRITERIA_SUMMARY_FIELDS) == set(oic.CRITERIA_KEYS)
+    for fields in oic.CRITERIA_SUMMARY_FIELDS.values():
+        assert {"result", "value", "threshold_ratio"} <= fields
+
+
 # === EXPORTS ================================================================
 
 
@@ -88,25 +216,21 @@ def sample_report() -> dict:
             "total": 4,
             "met": 4,
             "threshold": 3,
-            "cpu": {"result": "IDLE", "value": "2.00"},
-            "memory": {"result": "IDLE", "value": "10.00"},
-            "api_server": {"result": "IDLE", "value": "5.00"},
+            "cpu": {"result": "IDLE", "value": "2.00", "threshold_ratio": 0.13},
+            "memory": {"result": "IDLE", "value": "10.00", "threshold_ratio": 0.29},
+            "api_server": {"result": "IDLE", "value": "5.00", "threshold_ratio": 0.05},
             "gpu": {"result": "N/A", "value": None},
             "operators": {
                 "result": "IDLE",
                 "age_days": 12.0,
-                "units": [
-                    {
-                        "namespace": "opendatahub",
-                        "kind": "replicaset",
-                        "name": "odh-operator-5d4c3b",
-                        "age_days": 12.0,
-                    }
-                ],
-                "namespaces": ["opendatahub"],
                 "events": 0,
-                "events_excluded_workload": 0,
-                "event_window_hours": 48,
+                "threshold_ratio": 0.58,
+            },
+            "driver": {
+                "criterion": "operators",
+                "label": "Operators",
+                "threshold_ratio": 0.58,
+                "quorum_driven": False,
             },
         },
         "gpu": {
@@ -179,8 +303,19 @@ def test_export_json_round_trips(tmp_path):
     data = json.loads(path.read_text())
     assert data["status"] == "IDLE"
     assert data["criteria"]["gpu"]["value"] is None
-    # json.dump never emits Infinity; a null ratio must survive the round trip.
+    # The sample's ratios are all finite; the infinite case has its own test.
     assert "Infinity" not in path.read_text()
+
+
+def test_export_json_serializes_an_infinite_ratio(tmp_path):
+    # The floorless zero-baseline fire reads as inf; Python's json emits and
+    # reads back the non-standard Infinity token for it.
+    report = sample_report()
+    report["criteria"]["api_server"]["threshold_ratio"] = math.inf
+    path = tmp_path / "report.json"
+    oic.export_json(report, path)
+    assert "Infinity" in path.read_text()
+    assert json.loads(path.read_text())["criteria"]["api_server"]["threshold_ratio"] == math.inf
 
 
 def test_base_config_matches_shipped_defaults():

@@ -19,7 +19,6 @@ def test_defaults():
     assert cfg.operator_event_hours == oic.OPERATOR_EVENT_WINDOW_HOURS
     assert cfg.verbose is True
     assert cfg.check_ml_nodes is True
-    assert cfg.debug_probe is False
     assert cfg.token == ""
     assert cfg.csv_path is None
     assert cfg.json_path is None
@@ -73,7 +72,8 @@ def test_removed_and_renamed_variance_flags_are_rejected():
     # The API variance floor flag was removed outright (the CPU/GPU floors
     # are module constants, never flags), and the ratio/floor flags were
     # renamed to *-variance-*; old spellings must fail loudly rather than
-    # be silently ignored.
+    # be silently ignored.  The same goes for --debug-probe: it gated a
+    # diagnostics export that no longer exists.
     with pytest.raises(SystemExit):
         oic.parse_args(["--cpu-shape-floor", "20"])
     with pytest.raises(SystemExit):
@@ -88,6 +88,8 @@ def test_removed_and_renamed_variance_flags_are_rejected():
         oic.parse_args(["--api-spike-floor", "75"])
     with pytest.raises(SystemExit):
         oic.parse_args(["--api-variance-floor", "75"])
+    with pytest.raises(SystemExit):
+        oic.parse_args(["--debug-probe"])
 
 
 def test_legacy_flags_still_parse():
@@ -107,7 +109,6 @@ def test_legacy_flags_still_parse():
             "foo,bar",
             "--token",
             "t",
-            "--debug-probe",
         ]
     )
     assert cfg.cpu_idle_threshold == 20.0
@@ -117,7 +118,6 @@ def test_legacy_flags_still_parse():
     assert cfg.operator_age_days == 14
     assert cfg.operator_namespaces == "foo,bar"
     assert cfg.token == "t"
-    assert cfg.debug_probe is True
 
 
 def test_export_paths_parse(tmp_path):

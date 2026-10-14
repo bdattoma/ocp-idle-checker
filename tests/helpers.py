@@ -88,7 +88,6 @@ def base_config(**overrides) -> oic.Config:
         gpu_variance_ratio=2.0,
         api_variance_ratio=2.0,
         verbose=False,
-        debug_probe=False,
         token="",
         csv_path=None,
         json_path=None,

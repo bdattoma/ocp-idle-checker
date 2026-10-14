@@ -60,8 +60,6 @@ The required peak follows one power law shared by all three variance rules, in e
 
 The multiple is `variance-ratio` (default 2×) at a baseline of 50 and above; below, the variance rule is the sensitive branch. Above each criterion's normal threshold nothing needs the variance rule at all — a window over the peak threshold fires the peak rule (CPU/GPU), and an API median large enough to shallow the curve implies a windowed average over the request threshold — so the curve carries no cap. The CPU and GPU rules carry an absolute floor — 1% and 5% — that is the minimum required peak and the whole requirement on a zero median: DCGM's 1-4% idle noise tail (kernel-residency blips from context init, ECC scrubbing, and health probes, not real use) on a zero-median exporter stays idle under the 5% GPU floor. The API rule has no floor; a zero median there demands only a positive request rate. Fleet calibration put the CPU peak threshold at 30%: the 30-40% max-peak band is sustained workloads the variance rule cannot see (a steady node sits near its own median), idle exemplars peak below 20%, and the highest one-off blip below 40% sits at 26.9%.
 
-The criteria JSON detail exports each node's peak, median, ratio, required multiple, and required peak (`per_node`), with the cluster-level summary reporting the pooled peak plus the baseline/ratio of the node that came closest to (or furthest past) its own requirement (`node`, `required_ratio`, `required_peak`).
-
 CPU falls back to the legacy window-average rule when the range matrix is unavailable, and an instant `oc adm top nodes` reading above the idle threshold can still override an IDLE result (one-directional, as in the bash version). When there is no windowed data at all, the instant snapshot can only accuse, never acquit: a busy instant votes ACTIVE, but a quiet one reads UNKNOWN (counted) — one sample is evidence of activity, not proof the whole window was quiet. Windowless runs (`--window 0`) still judge on the instant alone, since there the instant is the whole question. The GPU rule deliberately keeps series from deleted GPU nodes — their samples are still activity — and falls back to whole-window max/avg aggregates when the matrix is unavailable.
 
 ### Variance Detection (API Server)
@@ -74,7 +72,7 @@ The scan is cluster-wide: every namespace counts except those matching the exclu
 
 Each controller is aged by its **ReplicaSet**, not its pod: a node drain recreates pods without meaning the operator was reinstalled, so the ReplicaSet's creation timestamp — which only moves on a real rollout — is joined via the pod's owner references. Pods without a ReplicaSet owner (or whose ReplicaSet has been deleted mid-rollout) fall back to their own pod age.
 
-The criterion votes on the **median** age across controllers, so one stale survivor cannot mask a fleet-wide reinstall and one fresh restart cannot mark a quiet cluster active. Reconciliation activity is counted over a 48-hour window; events about workload objects (pods, replica sets, deployments, and the like — the noise a churning workload or a node drain manufactures) are excluded from that count and exported separately as `events_excluded_workload` for calibration.
+The criterion votes on the **median** age across controllers, so one stale survivor cannot mask a fleet-wide reinstall and one fresh restart cannot mark a quiet cluster active. Reconciliation activity is counted over a 48-hour window; events about workload objects (pods, replica sets, deployments, and the like — the noise a churning workload or a node drain manufactures) are excluded from that count.
 
 ### Instant Override (Memory)
 
@@ -100,6 +98,37 @@ Some criteria are **skipped** (not counted in the total) when the required data 
 
 CPU and memory `UNKNOWN` still count toward the denominator (they never help the IDLE count, only the total), and so does a GPU `UNKNOWN` from a failed node listing.
 
+### Threshold Ratio (how close to the cutoff)
+
+Every criterion exports a `threshold_ratio`: its hottest reading as a fraction of the level that fires it, so ≥ 1.0 means that reading fired the criterion. The ratio is dimensionless — percent over percent, requests over requests — which makes the criteria comparable:
+
+| Criterion | Hottest reading over |
+|---|---|
+| **CPU** | the hottest node's window peak over the peak threshold (30%) and over that node's own required peak; the legacy window average over 15%; the instant reading over 15% |
+| **Memory** | the windowed average over 35%; the instant snapshot over 35% |
+| **API Server** | the windowed average over 100 req/s; the variance peak over its baseline-scaled required peak |
+| **GPU** | the hottest node's window peak over the peak threshold (40%) and over that node's own required peak |
+| **Operators** | the event count over 5; the age threshold over the median controller age, inverted because younger is hotter — a 2-day median against the 7-day threshold reads 350% |
+
+When several paths could fire one criterion (a node's peak against two levels, the instant override alongside the windows), the hottest wins.
+
+The report also names the **driver**: the criterion sitting at the verdict's boundary.
+
+- **IDLE verdict** → the hottest criterion that voted IDLE — the one *closest to active*, whose flip would eat the quorum.
+- **ACTIVE verdict** → the hottest criterion overall, necessarily at or past 1.0 — unless nothing fired and UNKNOWN votes deprived the quorum, which the report flags as `"quorum_driven": true`.
+
+The STATUS line keeps its `STATUS: <verdict>` prefix (parsers key on it) and carries the driver as an annotation:
+
+```
+STATUS: IDLE (closest to active: Operators at 58% of threshold)
+STATUS: ACTIVE (CPU at 194% of threshold)
+STATUS: ACTIVE (UNKNOWN-driven; API Server at 19% of threshold)
+```
+
+Verbose runs state the same fact above the summary ("Closest to active: ..." / "Most active: ..."). The JSON gains each criterion's `threshold_ratio` plus a `criteria.driver` object (`null` when no criterion has a ratio — every vote UNKNOWN or N/A).
+
+Edge cases: UNKNOWN and N/A criteria carry no ratio (`null`); the floorless zero-baseline API fire (any positive peak over a zero median) has no finite ratio, reads as `Infinity` in JSON — Python's `json` and `jq` both read it back — and displays as `999%+`. A ratio of exactly 1.000 can sit on either side of the verdict (strict vs. non-strict firing comparisons); the verdict stays authoritative.
+
 ## Command Line Options
 
 | Option | Description | Default |
@@ -123,7 +152,6 @@ CPU and memory `UNKNOWN` still count toward the denominator (they never help the
 | `-e, --events MINUTES` | Event history window for informational output | 60 |
 | `-q, --quiet` | Minimal output | false |
 | `--no-ml-check` | Skip the ML/GPU node check | false |
-| `--debug-probe` | Accepted for compatibility; criteria detail is always exported now | false |
 
 The variance parameters are fleet-calibration knobs; the defaults are provisional.
 
@@ -154,7 +182,7 @@ Export to CSV (append mode) or JSON for automation and historical tracking.
 
 **CSV Format:**
 ```csv
-timestamp,cluster,status,cpu_result,cpu_value,memory_result,...,gpu_result,gpu_value,operators_result,...,has_gpu_nodes,gpu_node_count,gpu_flavors,gpu_node_age,...
+timestamp,cluster,status,cpu_result,cpu_value,memory_result,...,gpu_result,gpu_value,operators_result,...,has_gpu_nodes,gpu_node_count,gpu_flavors,gpu_node_age,...,gpu_cpu_windowed,gpu_mem_windowed
 ```
 
 **JSON Format:**
@@ -162,19 +190,10 @@ timestamp,cluster,status,cpu_result,cpu_value,memory_result,...,gpu_result,gpu_v
 {
   "status": "IDLE",
   "criteria": {
-    "cpu": {
-      "result": "IDLE",
-      "peak": 9.0,
-      "baseline": 3.0,
-      "ratio": 3.0,
-      "required_ratio": 6.36,
-      "required_peak": 19.09,
-      "node": "node-1",
-      "per_node": [
-        {"node": "node-1", "peak": 9.0, "baseline": 3.0, "ratio": 3.0, "required_ratio": 6.36, "required_peak": 19.09, "points": 673, "peak_exceeded": false, "variance_exceeded": false}
-      ]
-    },
-    "gpu": { "result": "ACTIVE", "peak": 80.0 },
+    "cpu": { "result": "IDLE", "value": 9.0, "threshold_ratio": 0.47 },
+    "gpu": { "result": "ACTIVE", "value": 80.0, "threshold_ratio": 2.0 },
+    "operators": { "result": "IDLE", "age_days": 12.0, "events": 0, "threshold_ratio": 0.58 },
+    "driver": { "criterion": "gpu", "label": "GPU", "threshold_ratio": 2.0, "quorum_driven": false },
     ...
   },
   "gpu": {
@@ -185,6 +204,8 @@ timestamp,cluster,status,cpu_result,cpu_value,memory_result,...,gpu_result,gpu_v
   }
 }
 ```
+
+`criteria` keeps each criterion's headline fields — `result`, `value`, `threshold_ratio`, plus `age_days` and `events` for operators — so renderers that print it verbatim (the Jenkins report's Metrics column) stay compact. The diagnostics behind those fields (per-node variance numbers, operator units, failure reasons) are not exported.
 
 ## Use Cases
 
@@ -234,7 +255,7 @@ Memory: ACTIVE
 API Server: IDLE
 GPU: N/A
 Operators: IDLE
-STATUS: IDLE
+STATUS: IDLE (closest to active: API Server at 42% of threshold)
 ```
 
 ## Configuration
