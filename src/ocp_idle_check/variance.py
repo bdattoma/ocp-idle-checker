@@ -149,6 +149,7 @@ def evaluate_variance_by_node(
     live_nodes: set[str] | None = None,
     baseline_mode: str = "median",
     node_peak_thresholds: dict[str, float] | None = None,
+    variance_only_nodes: set[str] | None = None,
 ) -> list[VarianceStats]:
     """Evaluate the variance rule once per node, each against its own
     baseline (trough or median per `baseline_mode`).
@@ -163,7 +164,11 @@ def evaluate_variance_by_node(
     node's samples are still activity.  `node_peak_thresholds`, when given,
     scales each node's absolute peak threshold (CPU: large machines rarely
     max out their cores, so the percent bar eases with core count) and
-    moves the curve's handoff point with it.  Series with neither a `node`
+    moves the curve's handoff point with it.  `variance_only_nodes`, when
+    given, strips the absolute peak branch for those nodes - only the
+    baseline-scaled burst rule can accuse them (CPU: a cluster's
+    control-plane nodes when it has workers, whose steady load is platform
+    overhead rather than workload activity).  Series with neither a `node`
     nor an `instance` label share the empty node name and pool as one
     group.  Returns stats sorted by node name for deterministic output.
     """
@@ -179,9 +184,13 @@ def evaluate_variance_by_node(
         evaluate_variance(
             points,
             peak_threshold=(
-                node_peak_thresholds.get(node, peak_threshold)
-                if node_peak_thresholds
-                else peak_threshold
+                None
+                if variance_only_nodes and node in variance_only_nodes
+                else (
+                    node_peak_thresholds.get(node, peak_threshold)
+                    if node_peak_thresholds
+                    else peak_threshold
+                )
             ),
             ratio_threshold=ratio_threshold,
             floor=floor,

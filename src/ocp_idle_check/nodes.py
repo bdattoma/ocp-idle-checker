@@ -64,15 +64,30 @@ def node_cpu_cores(items: list[dict[str, Any]]) -> dict[str, float]:
     return cores
 
 
+# Role labels that mark a node as control-plane capacity.  The CPU rule
+# judges these by variance alone when the cluster has workers (see
+# check_cpu): a busy control plane cannot be right-sized away, and its
+# steady load is platform overhead, not workload activity.
+MASTER_ROLE_LABELS = (
+    "node-role.kubernetes.io/master",
+    "node-role.kubernetes.io/control-plane",
+)
+
 # Role labels that mark a node as platform capacity rather than schedulable
 # worker capacity.  A quiet node with one of these is expected, not
 # right-sizing evidence: control-plane nodes cannot be removed, and infra
 # nodes run required platform services.
-NON_WORKER_ROLE_LABELS = (
-    "node-role.kubernetes.io/master",
-    "node-role.kubernetes.io/control-plane",
-    "node-role.kubernetes.io/infra",
-)
+NON_WORKER_ROLE_LABELS = (*MASTER_ROLE_LABELS, "node-role.kubernetes.io/infra")
+
+
+def master_nodes_from_items(items: list[dict[str, Any]]) -> set[str]:
+    """Names of nodes with master or control-plane role labels."""
+    names: set[str] = set()
+    for item in items:
+        labels = item.get("metadata", {}).get("labels", {})
+        if any(role in labels for role in MASTER_ROLE_LABELS):
+            names.add(str(item.get("metadata", {}).get("name", "")))
+    return names
 
 
 def worker_nodes_from_items(items: list[dict[str, Any]]) -> set[str]:

@@ -37,7 +37,9 @@ from .nodes import (
     fmt2,
     gpu_nodes_from_items,
     instant_averages,
+    master_nodes_from_items,
     node_cpu_cores,
+    node_top_percentages,
     worker_nodes_from_items,
 )
 from .oc import Oc
@@ -79,13 +81,37 @@ def run(argv: list[str] | None = None) -> int:
         live_nodes = None
         gpu_nodes = None
         node_cores = None
+        variance_only_nodes: set[str] = set()
         log_warn("Node listing failed (oc error or timeout)")
     else:
         live_nodes = {str(item.get("metadata", {}).get("name", "")) for item in node_items}
         gpu_nodes = gpu_nodes_from_items(node_items)
         node_cores = node_cpu_cores(node_items)
         log_info(f"Nodes: {len(live_nodes)} ({len(gpu_nodes)} with GPUs)")
-    instant_cpu, instant_mem = instant_averages(oc.top_nodes())
+        # CPU judges control-plane nodes by variance alone when the cluster
+        # has workers: a busy control plane cannot be right-sized away, so
+        # its steady load is platform overhead, not workload activity.  A
+        # cluster with no workers keeps the full rule - there the masters
+        # are the workload.
+        variance_only_nodes = (
+            master_nodes_from_items(node_items) & live_nodes
+            if worker_nodes_from_items(node_items)
+            else set()
+        )
+        if variance_only_nodes:
+            log_info(f"Variance-only CPU nodes (masters): {len(variance_only_nodes)}")
+    top_lines = oc.top_nodes()
+    instant_cpu, instant_mem = instant_averages(top_lines)
+    if variance_only_nodes:
+        # The instant accusation is worker-only too: masters' steady load
+        # must not drag the pooled cluster average over the threshold.
+        worker_cpu = [
+            cpu
+            for node, (cpu, _) in node_top_percentages(top_lines).items()
+            if node not in variance_only_nodes
+        ]
+        if worker_cpu:
+            instant_cpu = sum(worker_cpu) / len(worker_cpu)
 
     log_info(f"Instant cluster CPU: {fmt2(instant_cpu)}%, memory: {fmt2(instant_mem)}%")
 
@@ -100,7 +126,7 @@ def run(argv: list[str] | None = None) -> int:
         (
             "CPU Utilization",
             "CPU",
-            lambda: check_cpu(cfg, prom, live_nodes, instant_cpu, node_cores),
+            lambda: check_cpu(cfg, prom, live_nodes, instant_cpu, node_cores, variance_only_nodes),
         ),
         ("Memory Utilization", "Memory", lambda: check_memory(cfg, prom, instant_mem, live_nodes)),
         ("API Server Activity", "API Server", lambda: check_api(cfg, prom)),

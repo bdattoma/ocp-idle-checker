@@ -18,6 +18,18 @@ def test_worker_nodes_from_items_drops_role_labeled_nodes():
     assert oic.worker_nodes_from_items(items) == {"worker-0", "bare-0"}
 
 
+def test_master_nodes_from_items_keeps_only_control_plane():
+    items = [
+        {"metadata": {"name": "master-0", "labels": {"node-role.kubernetes.io/master": ""}}},
+        {"metadata": {"name": "cp-0", "labels": {"node-role.kubernetes.io/control-plane": ""}}},
+        {"metadata": {"name": "infra-0", "labels": {"node-role.kubernetes.io/infra": ""}}},
+        {"metadata": {"name": "worker-0", "labels": {"node-role.kubernetes.io/worker": ""}}},
+    ]
+    # Infra is platform capacity but not control plane: the variance-only
+    # CPU rule is about masters specifically.
+    assert oic.master_nodes_from_items(items) == {"master-0", "cp-0"}
+
+
 def test_node_top_percentages_maps_and_skips_malformed():
     lines = [
         "node-1 250m 2% 3212Mi 5%",

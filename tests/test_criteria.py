@@ -153,6 +153,83 @@ def test_cpu_core_scaled_peak_threshold():
     assert outcome2.result == "IDLE"
 
 
+def test_cpu_masters_variance_only_when_workers_exist():
+    # The motivating pattern: flat-hot control-plane nodes (35% steady, over
+    # the 30% peak threshold, never bursty) over quiet workers.  Judged by
+    # variance alone the cluster is idle; the instant stays silent because
+    # the caller passes the worker-only average.
+    prom = FakeProm(
+        ranges={
+            oic.CPU_RANGE_QUERY: [
+                make_range_series("master-0", ["35"] * 10),
+                make_range_series("master-1", ["34"] * 10),
+                make_range_series("worker-0", ["3"] * 10),
+            ]
+        }
+    )
+    outcome = oic.check_cpu(
+        base_config(),
+        prom,
+        {"master-0", "master-1", "worker-0"},
+        3.0,
+        variance_only_nodes={"master-0", "master-1"},
+    )
+    assert outcome.result == "IDLE"
+    assert outcome.entry["peak_exceeded"] is False
+    assert outcome.entry["variance_exceeded"] is False
+    assert outcome.entry["variance_only_nodes"] == ["master-0", "master-1"]
+    per_node = {e["node"]: e for e in outcome.entry["per_node"]}
+    assert per_node["master-0"]["peak_exceeded"] is False
+
+    # Without the exemption the same cluster is ACTIVE on the peak branch.
+    plain = oic.check_cpu(base_config(), prom, {"master-0", "master-1", "worker-0"}, 3.0)
+    assert plain.result == "ACTIVE"
+    assert plain.entry["peak_exceeded"] is True
+
+    # A bursty master still accuses through the variance rule alone.
+    burst = FakeProm(
+        ranges={
+            oic.CPU_RANGE_QUERY: [
+                make_range_series("master-0", ["5"] * 10 + ["40"]),
+                make_range_series("worker-0", ["3"] * 11),
+            ]
+        }
+    )
+    outcome = oic.check_cpu(
+        base_config(),
+        burst,
+        {"master-0", "worker-0"},
+        3.0,
+        variance_only_nodes={"master-0"},
+    )
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["peak_exceeded"] is False
+    assert outcome.entry["variance_exceeded"] is True
+
+
+def test_cpu_master_instant_override_still_fires_on_worker_snapshot():
+    # The instant accusation is one-directional and, for a cluster with
+    # variance-only masters, worker-fed by the caller: a busy worker
+    # snapshot still overrides an idle window verdict.
+    prom = FakeProm(
+        ranges={
+            oic.CPU_RANGE_QUERY: [
+                make_range_series("master-0", ["35"] * 10),
+                make_range_series("worker-0", ["3"] * 10),
+            ]
+        }
+    )
+    outcome = oic.check_cpu(
+        base_config(),
+        prom,
+        {"master-0", "worker-0"},
+        20.0,
+        variance_only_nodes={"master-0"},
+    )
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["instant_override"] is True
+
+
 def test_cpu_steady_busy_and_quiet_nodes_are_idle():
     # Two steady modes pooled together: a steady ~17% node pooled with a
     # steady ~2% node.  Pooled, the median lands between the modes

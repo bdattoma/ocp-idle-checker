@@ -113,11 +113,20 @@ def check_cpu(
     live_nodes: set[str] | None,
     instant_cpu: float | None,
     node_cores: dict[str, float] | None = None,
+    variance_only_nodes: set[str] | None = None,
 ) -> CheckOutcome:
     """CPU criterion: variance rule on 15-minute windows, with the
     one-directional instant override.  An unavailable range matrix is not
     smoothed over with the legacy window average: it falls to the instant
-    accusation or UNKNOWN."""
+    accusation or UNKNOWN.
+
+    `variance_only_nodes` names nodes judged by the variance rule alone -
+    the control-plane nodes of a cluster that has workers (the caller
+    passes an empty set otherwise).  Their steady load is platform
+    overhead that cannot be right-sized away, so neither the absolute
+    peak threshold nor the instant accusation may accuse on their
+    behalf; only a burst against their own baseline does.  The caller
+    keeps the instant itself worker-only for the same reason."""
     entry: dict[str, Any] = {"result": "UNKNOWN", "value": None, "threshold_ratio": None}
     stats: VarianceStats | None = None
     per_node: list[VarianceStats] = []
@@ -156,9 +165,12 @@ def check_cpu(
                     if node_cores
                     else None
                 ),
+                variance_only_nodes=variance_only_nodes,
             )
             if per_node:
                 stats = summarize_variance(per_node)
+    if variance_only_nodes:
+        entry["variance_only_nodes"] = sorted(variance_only_nodes)
 
     active = False
     source = None

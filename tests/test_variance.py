@@ -255,6 +255,34 @@ def test_evaluate_variance_by_node_filters_dead_nodes():
     assert [s.node for s in per_node] == ["live-node"]
 
 
+def test_evaluate_variance_by_node_variance_only_drops_the_peak_branch():
+    # A flat-hot master over its core-scaled threshold stays idle under the
+    # variance-only rule; the same series without the exemption fires on the
+    # absolute branch.  A burst on the master still accuses.
+    flat = ["35"] * 10
+    series = [make_range_series("master-0", flat), make_range_series("worker-0", ["3"] * 10)]
+    per_node = oic.evaluate_variance_by_node(
+        series, peak_threshold=30.0, ratio_threshold=2.0, variance_only_nodes={"master-0"}
+    )
+    by_node = {s.node: s for s in per_node}
+    assert by_node["master-0"].peak_exceeded is False
+    assert by_node["master-0"].peak_threshold is None
+    assert by_node["master-0"].variance_exceeded is False  # flat, not bursty
+    assert not oic.summarize_variance(per_node).active
+
+    # Without the exemption the flat-hot master accuses on the peak branch.
+    plain = oic.evaluate_variance_by_node(series, peak_threshold=30.0, ratio_threshold=2.0)
+    assert {s.node: s for s in plain}["master-0"].peak_exceeded is True
+
+    # A real burst on the master still fires the variance rule alone.
+    bursty = [make_range_series("master-0", ["5"] * 10 + ["28"])]
+    per_node = oic.evaluate_variance_by_node(
+        bursty, peak_threshold=30.0, ratio_threshold=2.0, variance_only_nodes={"master-0"}
+    )
+    assert per_node[0].peak_exceeded is False
+    assert per_node[0].variance_exceeded is True
+
+
 def test_evaluate_variance_by_node_floor_suppresses_zero_baseline_noise():
     # The GPU rule's floor: a zero-median exporter peaking at 3% (DCGM's
     # idle noise tail) stays idle next to a
