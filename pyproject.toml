@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ocp-idle-checker"
+version = "2.0.0"
+description = "OpenShift cluster idle detection (Python package behind a bash entrypoint shim)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+ocp-idle-check = "ocp_idle_check.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ocp_idle_check"]
+
+[dependency-groups]
+dev = [
+    "ruff==0.15.20",
+    "pytest>=9.1.1",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "B", "PTH", "FURB", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["ocp_idle_check", "helpers"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+pythonpath = ["src", "tests"]
